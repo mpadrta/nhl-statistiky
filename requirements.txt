@@ -1,0 +1,1 @@
+# Žádné balíčky nejsou potřeba – program používá jen standardní knihovnu Pythonu.
