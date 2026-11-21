@@ -597,7 +597,7 @@ def predict_game(g, teams, lg, roster, info):
     sd_tot = math.sqrt(ph["sf_sd"] ** 2 + pa["sf_sd"] ** 2)
 
     def shots_block(lam, sd, step=2):
-        return {"exp": round(lam, 1),
+        return {"exp": round(lam, 1), "sd": round(sd, 3), "mean": round(lam, 3),
                 "lines": [{"line": l, "over": round(_nover(l, lam, sd), 4)} for l in _lines(lam, step)]}
 
     def pois_block(lam):
@@ -818,7 +818,7 @@ def chat(messages, gid=None):
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192},
     }).encode()
     last_err = None
     for model in gemini_models(key)[:5]:
@@ -828,6 +828,8 @@ def chat(messages, gid=None):
             cand = (d.get("candidates") or [{}])[0]
             text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", []) if not p.get("thought"))
             if text.strip():
+                if cand.get("finishReason") == "MAX_TOKENS":
+                    text = text.rstrip() + "\n\n_(odpověď byla moc dlouhá a zkrátila se – zeptej se konkrétněji)_"
                 return {"reply": text.strip(), "model": model}
             last_err = "AI vrátila prázdnou odpověď."
         except urllib.error.HTTPError as e:
@@ -1055,6 +1057,34 @@ details.gloss dd { margin: 0; color: #c3cee0; line-height: 1.55; }
 .reveal.in { opacity: 1; transform: none; }
 .mcard .wmL, .mcard .wmR { position: absolute; width: 190px; height: 190px; opacity: .07; top: 20px; pointer-events: none; }
 .mcard .wmL { left: -60px; } .mcard .wmR { right: -60px; }
+/* interaktivita */
+#progress { position: fixed; left: 0; top: 0; height: 3px; width: 0; z-index: 100; background: linear-gradient(90deg, var(--cyan), var(--violet), var(--gold)); }
+.cine .spot { position: absolute; inset: 0; pointer-events: none; opacity: .9;
+  background: radial-gradient(420px circle at var(--mx, 70%) var(--my, 30%), rgba(56,189,248,.22), transparent 60%); transition: background .08s; }
+.cine h1, .cine .kicker, .cine .lead { will-change: transform; }
+.tilt { transform-style: preserve-3d; transition: transform .18s ease-out, box-shadow .2s; will-change: transform; }
+.tilt .glare { position: absolute; inset: 0; pointer-events: none; border-radius: inherit; opacity: 0; transition: opacity .2s;
+  background: radial-gradient(300px circle at var(--gx, 50%) var(--gy, 50%), rgba(255,255,255,.16), transparent 60%); }
+.tilt:hover .glare { opacity: 1; }
+.pcard.reveal.in .big, .mcard.reveal.in .xg { animation: pop .7s cubic-bezier(.2,1.4,.4,1) both; }
+@keyframes pop { from { transform: scale(.6); opacity: 0; } to { transform: none; opacity: 1; } }
+.wbar i { transition: width 1.1s cubic-bezier(.2,.8,.2,1); }
+.cmp .bar i { transition: width 1.1s cubic-bezier(.2,.8,.2,1); }
+.countdown { font-variant-numeric: tabular-nums; color: var(--cyan); font-weight: 800; }
+.slider { margin-top: 6px; }
+.slider .srow { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; }
+.slider input[type=range] { width: 100%; accent-color: var(--gold); height: 28px; cursor: pointer; }
+.slider .lineval { font-family: Anton, Impact, sans-serif; font-size: 54px; line-height: 1; color: #fff; min-width: 120px; text-align: right; }
+.slider .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.slider .side { border-radius: 16px; padding: 16px; border: 1px solid var(--line2); background: rgba(255,255,255,.04); position: relative; overflow: hidden; }
+.slider .side .fill { position: absolute; left: 0; bottom: 0; top: 0; opacity: .18; transition: width .35s; }
+.slider .side.over .fill { background: var(--green); } .slider .side.under .fill { background: var(--red); }
+.slider .side > *:not(.fill) { position: relative; }
+.slider .side small { color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: 12px; }
+.slider .side b { display: block; font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 48px; line-height: 1.05; }
+.slider .side span { color: #c7d3e6; font-size: 14px; }
+.slider .dist { margin-top: 14px; }
+.slider .dist svg { width: 100%; height: auto; display: block; }
 /* top bar */
 .topbar { position: sticky; top: 0; z-index: 30; backdrop-filter: blur(14px); background: rgba(7,11,20,.72);
   border-bottom: 1px solid var(--line); }
@@ -1280,6 +1310,7 @@ td.gold { color: var(--gold); font-weight: 800; }
 </style>
 </head>
 <body>
+<div id="progress"></div>
 <div class="topbar"><div class="wrap">
   <a class="brand" href="#"><span class="puck">🏒</span><span>NHL Predikce<small>body · střely · vyloučení · kurzy</small></span></a>
   <nav class="nav">
@@ -1377,7 +1408,7 @@ function splitName(n) { const i = String(n).indexOf(" "); return i < 0 ? ["", n]
 function playerCard(p, logo, extra = "") {
   const [first, last] = splitName(p.name);
   const dots = (p.last5 || []).slice().reverse().map((x) => `<i class="${x > 0 ? "y" : ""}"></i>`).join("");
-  return `<div class="pcard reveal" style="--tc:${tcol(p.team)}" ${extra}>
+  return `<div class="pcard reveal tilt" style="--tc:${tcol(p.team)}" ${extra}><span class="glare"></span>
     <div class="jn">${p.num ?? ""}</div><img class="wm" src="${esc(logo)}" alt="">
     ${p.streak >= 3 ? `<span class="pill hot streak">🔥 ${p.streak} v řadě</span>` : ""}
     <div class="top"><img src="${esc(logo)}" alt=""><small>${esc(p.team)} · ${posName[p.pos] || p.pos}${p.num != null ? " · #" + p.num : ""}</small></div>
@@ -1387,6 +1418,104 @@ function playerCard(p, logo, extra = "") {
       <div><b><span class="dots">${dots}</span></b><small>posl. 5 zápasů</small></div></div>
   </div>`;
 }
+// ---------- interaktivita ----------
+function erf(x) { const s = Math.sign(x); x = Math.abs(x); const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x); return s * y; }
+const ncdf = (x, m, sd) => 0.5 * (1 + erf((x - m) / (sd * Math.SQRT2)));
+function pois(k, l) { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l / i; return p; }
+function poisCdf(k, l) { let s = 0; for (let i = 0; i <= k; i++) s += pois(i, l); return s; }
+function countUp(root) {
+  root.querySelectorAll("[data-count]").forEach((el) => {
+    const to = +el.dataset.count, t0 = performance.now(), dur = 1400;
+    const step = (t) => { const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3); el.textContent = Math.round(to * e); if (k < 1) requestAnimationFrame(step); };
+    requestAnimationFrame(step);
+  });
+}
+function tilt(root) {
+  if (matchMedia("(hover: none)").matches) return;
+  root.querySelectorAll(".tilt").forEach((c) => {
+    c.onmousemove = (e) => {
+      const r = c.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      c.style.transform = `perspective(900px) rotateY(${(x - 0.5) * 10}deg) rotateX(${(0.5 - y) * 10}deg) translateY(-4px)`;
+      c.style.setProperty("--gx", x * 100 + "%"); c.style.setProperty("--gy", y * 100 + "%");
+    };
+    c.onmouseleave = () => { c.style.transform = ""; };
+  });
+}
+function countdowns() {
+  document.querySelectorAll(".countdown[data-start]").forEach((el) => {
+    const ms = new Date(el.dataset.start) - Date.now();
+    if (ms <= 0) { el.textContent = "právě se hraje / brzy začne"; return; }
+    const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000), s = Math.floor((ms % 60000) / 1000);
+    el.textContent = `začíná za ${h > 23 ? Math.floor(h / 24) + " d " + (h % 24) + " h" : h + " h " + String(m).padStart(2, "0") + " min " + String(s).padStart(2, "0") + " s"}`;
+  });
+}
+setInterval(countdowns, 1000);
+function interactive(root) {
+  tilt(root); countUp(root); countdowns();
+  const cine = root.querySelector("#cine");
+  if (cine) cine.onmousemove = (e) => {
+    const r = cine.getBoundingClientRect();
+    cine.style.setProperty("--mx", e.clientX - r.left + "px"); cine.style.setProperty("--my", e.clientY - r.top + "px");
+  };
+  // pruhy naběhnou od nuly
+  root.querySelectorAll(".wbar i, .cmp .bar i").forEach((b) => { const w = b.style.width; b.style.width = "0"; requestAnimationFrame(() => setTimeout(() => (b.style.width = w), 60)); });
+}
+window.addEventListener("scroll", () => {
+  const h = document.documentElement, p = h.scrollTop / Math.max(1, h.scrollHeight - h.clientHeight);
+  $("progress").style.width = p * 100 + "%";
+  const cine = document.getElementById("cine");
+  if (cine && !cine.closest(".hidden")) {
+    const y = Math.min(window.scrollY, 900);
+    cine.querySelector("h1").style.transform = `translateY(${y * 0.35}px)`;
+    cine.querySelector(".lead").style.transform = `translateY(${y * 0.2}px)`;
+    cine.querySelector("h1").style.opacity = 1 - y / 700;
+  }
+}, { passive: true });
+let SL = { kind: "shots.total" };
+function slCfg() {
+  const [grp, side] = SL.kind.split(".");
+  const d = GAME;
+  if (grp === "shots") { const b = d.shots[side]; return { normal: true, mean: b.mean ?? b.exp, sd: b.sd ?? 6, lab: "střel", step: 1 }; }
+  if (grp === "goals") return { normal: false, mean: d.goals.total, lab: "gólů" };
+  return { normal: false, mean: d.pens[side].exp, lab: "vyloučení" };
+}
+function initSlider() {
+  segment($("slkind"), (v) => { SL.kind = v; setupRange(); });
+  $("slrange").oninput = updateSlider;
+  setupRange();
+}
+function setupRange() {
+  const c = slCfg(), r = $("slrange");
+  const lo = Math.max(0.5, Math.floor(c.mean - (c.normal ? 3 * c.sd : 3 * Math.sqrt(c.mean) + 1)) + 0.5);
+  const hi = Math.floor(c.mean + (c.normal ? 3 * c.sd : 3 * Math.sqrt(c.mean) + 2)) + 0.5;
+  r.min = lo; r.max = hi; r.step = 1; r.value = Math.floor(c.mean) + 0.5;
+  updateSlider();
+}
+function updateSlider() {
+  const c = slCfg(), line = +$("slrange").value;
+  const over = c.normal ? 1 - ncdf(line, c.mean, c.sd) : 1 - poisCdf(Math.floor(line), c.mean);
+  $("slval").textContent = line.toFixed(1);
+  $("slpo").textContent = pc(over); $("slpu").textContent = pc(1 - over);
+  $("slfa").textContent = `${Math.floor(line) + 1} a víc ${c.lab} · férový kurz ${fair(over)}`;
+  $("slfb").textContent = `${Math.floor(line)} a míň ${c.lab} · férový kurz ${fair(1 - over)}`;
+  $("slfo").style.width = over * 100 + "%"; $("slfu").style.width = (1 - over) * 100 + "%";
+  // graf rozdělení
+  const lo = +$("slrange").min - 0.5, hi = +$("slrange").max + 0.5, ks = [];
+  for (let k = Math.ceil(lo); k <= Math.floor(hi); k++) ks.push(k);
+  const pk = (k) => (c.normal ? ncdf(k + 0.5, c.mean, c.sd) - ncdf(k - 0.5, c.mean, c.sd) : pois(k, c.mean));
+  const W = 620, H = 150, mx = Math.max(...ks.map(pk)) * 1.1, bw = W / ks.length;
+  let svg = `<svg viewBox="0 0 ${W} ${H + 22}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">`;
+  ks.forEach((k, i) => {
+    const h = (pk(k) / mx) * H, isO = k > line;
+    svg += `<rect x="${i * bw + 1}" y="${H - h}" width="${bw - 2}" height="${h}" rx="2" fill="${isO ? "#34d399" : "#f87171"}" opacity=".75"><title>${k} ${c.lab}: ${pc(pk(k))}</title></rect>`;
+    if (ks.length < 30 || k % 2 === 0) svg += `<text x="${i * bw + bw / 2}" y="${H + 15}" font-size="10" fill="#8796ae" text-anchor="middle">${k}</text>`;
+  });
+  const lx = ((line - ks[0] + 0.5) / ks.length) * W;
+  svg += `<line x1="${lx}" x2="${lx}" y1="0" y2="${H}" stroke="#fbbf24" stroke-width="3"/></svg>`;
+  $("sldist").innerHTML = svg;
+}
+
 let revealObs = null;
 function reveal(root) {
   const els = root.querySelectorAll(".reveal");
@@ -1528,16 +1657,16 @@ function renderOverview() {
   const seen = new Set();
   const cards = [...all].sort((a, b) => b.pPoint - a.pPoint).filter((p) => !seen.has(p.id) && seen.add(p.id)).slice(0, 8);
   el.innerHTML = `
-    <section class="cine">${RINK}
+    <section class="cine" id="cine">${RINK}<div class="spot"></div>
       <div class="kicker">NHL · předpovědi · ${dayIso ? fmtDay(dayIso) : ""}</div>
       <h1 class="display">Hokejová noc<span>v číslech</span></h1>
       <p class="lead">Model prošel ${(OV.status?.total || 0)} odehraných zápasů sezóny a spočítal, kdo dá bod, kolik padne střel, gólů a vyloučení
         ${best ? `– největší šanci na bod má dnes <b style="color:#fff">${esc(best.name)}</b> (${pc(best.pPoint)}).` : "."}</p>
       <div class="counters">
-        <div><b>${dayGames.length}</b><small>zápasů</small></div>
-        <div><b>${sum((g) => g.goals.total).toFixed(0)}</b><small>očekávaných gólů</small></div>
-        <div><b>${sum((g) => g.shots.total).toFixed(0)}</b><small>očekávaných střel</small></div>
-        <div><b>${sum((g) => g.pens.total).toFixed(0)}</b><small>očekávaných vyloučení</small></div>
+        <div><b data-count="${dayGames.length}">0</b><small>zápasů</small></div>
+        <div><b data-count="${Math.round(sum((g) => g.goals.total))}">0</b><small>očekávaných gólů</small></div>
+        <div><b data-count="${Math.round(sum((g) => g.shots.total))}">0</b><small>očekávaných střel</small></div>
+        <div><b data-count="${Math.round(sum((g) => g.pens.total))}">0</b><small>očekávaných vyloučení</small></div>
       </div>
       <p class="help" style="position:relative">Čísla nahoře jsou součty za všechny zápasy vybraného dne. Den přepneš tlačítky níže.</p>
       <div class="seg daytabs" id="days">${days.map(([k, iso]) => `<button data-v="${k}" class="${k === ovDay ? "on" : ""}">${fmtDay(iso)}</button>`).join("")}</div>
@@ -1569,8 +1698,8 @@ function renderOverview() {
       než by podle modelu měl být (sázka se podle modelu vyplatí). <b>Σ</b> = součet za oba týmy. 🎯 = 3 hráči s největší šancí na bod.</p>
     <div class="matches">${dayGames.map((g) => {
       const wh = Math.round(g.win.home * 100), wa = 100 - wh;
-      return `<div class="card mcard reveal" data-go="${g.id}"><img class="wmL" src="${esc(g.homeLogo)}" alt=""><img class="wmR" src="${esc(g.awayLogo)}" alt="">
-        <div class="mtop"><span>${["LIVE", "CRIT"].includes(g.state) ? '<span class="pill live">● ŽIVĚ</span>' : "🕒 " + fmtTime(g.start)}</span><span>${esc(g.venue || "")}</span></div>
+      return `<div class="card mcard reveal tilt" data-go="${g.id}"><span class="glare"></span><img class="wmL" src="${esc(g.homeLogo)}" alt=""><img class="wmR" src="${esc(g.awayLogo)}" alt="">
+        <div class="mtop"><span>${["LIVE", "CRIT"].includes(g.state) ? '<span class="pill live">● ŽIVĚ</span>' : "🕒 " + fmtTime(g.start) + ` · <span class="countdown" data-start="${g.start}"></span>`}</span><span>${esc(g.venue || "")}</span></div>
         <div class="mteams">
           <div class="mteam"><img src="${esc(g.homeLogo)}" alt=""><b>${esc(g.home)}</b><small>${esc(g.homeName)}</small></div>
           <div class="mmid"><div class="xg">${g.goals.home.toFixed(1)} : ${g.goals.away.toFixed(1)}</div><small>očekávané góly</small></div>
@@ -1613,7 +1742,7 @@ function renderOverview() {
       Kurzy na vítěze (včetně prodloužení) jsou z Tipsportu přes oficiální NHL API. Data se obnovují každých 15 minut.
       Je to odhad, ne jistota – model neví o čerstvých zraněních a sestavách. Sázej jen to, co si můžeš dovolit prohrát.</div>`;
   segment($("days"), (v) => { ovDay = v; renderOverview(); });
-  reveal(el);
+  reveal(el); interactive(el);
   el.querySelectorAll("[data-go]").forEach((c) => (c.onclick = () => (location.hash = "zapas-" + c.dataset.go)));
 }
 
@@ -1749,7 +1878,7 @@ function renderGame() {
       <div class="hero-grid">
         <div class="hteam"><img src="${esc(d.homeLogo)}" alt=""><h2>${esc(d.homeName)}</h2><div class="muted">doma ${th.form.home} · celkem ${th.form.all}</div>
           <div class="form">${th.form.results5.slice().reverse().map((r) => `<span class="res ${r}">${r}</span>`).join("")}</div></div>
-        <div class="hmid"><div class="when">${fmtDay(d.start)} · ${fmtTime(d.start)}${d.venue ? " · " + esc(d.venue) : ""}</div>
+        <div class="hmid"><div class="when">${fmtDay(d.start)} · ${fmtTime(d.start)}${d.venue ? " · " + esc(d.venue) : ""}<br><span class="countdown" data-start="${d.start}"></span></div>
           <div class="score">${d.goals.home.toFixed(1)} : ${d.goals.away.toFixed(1)}</div>
           <div class="lbl">očekávané góly · nejčastější výsledek <b>${d.goals.likelyScore}</b> · prodloužení ${pc(d.win.ot)}</div></div>
         <div class="hteam"><img src="${esc(d.awayLogo)}" alt=""><h2>${esc(d.awayName)}</h2><div class="muted">venku ${ta.form.away} · celkem ${ta.form.all}</div>
@@ -1775,6 +1904,21 @@ function renderGame() {
         <p class="help">Kolik <b>trestů (vyloučení)</b> čekáme. Číslo u týmu = kolikrát půjdou <b>jeho</b> hráči na trestnou lavici. Ligový průměr je ${d.league.pens.toFixed(1)} na tým.</p></div>
       <div class="card stat"><h4>🥅 Góly</h4><div class="total">${d.goals.total.toFixed(1)} <small>celkem</small></div>${cmp(d.goals.home, d.goals.away, (x) => x.toFixed(2))}
         <p class="help">Kolik <b>gólů</b> čekáme celkem a za každý tým. Ligový průměr je ${d.league.goals.toFixed(2)} gólu na tým.</p></div>
+    </div>
+
+    <div class="sechead"><span class="no">⇆</span><h2>Přes nebo pod?</h2><span class="hint">posuň hranici a sleduj šanci</span></div>
+    <div class="card slider">
+      <p class="help" style="margin:0 0 12px">Vyber, co tě zajímá, a <b>táhni posuvníkem</b>. Velké číslo = hranice (např. 58.5 střel). Zelený box = šance, že padne <b>víc</b>,
+        červený = šance, že padne <b>míň</b>. Pod tím je férový kurz. Graf ukazuje, jak pravděpodobné je každé číslo – žlutá čára je tvoje hranice.</p>
+      <div class="seg" id="slkind" style="margin-bottom:14px">
+        <button data-v="shots.total" class="on">Střely celkem</button><button data-v="shots.home">Střely ${H}</button><button data-v="shots.away">Střely ${A}</button>
+        <button data-v="goals.total">Góly celkem</button><button data-v="pens.total">Vyloučení celkem</button><button data-v="pens.home">Vyloučení ${H}</button><button data-v="pens.away">Vyloučení ${A}</button></div>
+      <div class="srow"><input type="range" id="slrange"><div class="lineval" id="slval"></div></div>
+      <div class="split">
+        <div class="side over"><div class="fill" id="slfo"></div><small>Přes (víc než hranice)</small><b id="slpo"></b><span id="slfa"></span></div>
+        <div class="side under"><div class="fill" id="slfu"></div><small>Pod (míň než hranice)</small><b id="slpu"></b><span id="slfb"></span></div>
+      </div>
+      <div class="dist" id="sldist"></div>
     </div>
 
     <h2 class="sec" id="trhy">💰 Kurzy a hodnota sázek <span class="hint">zadej kurz z Tipsportu – zelená = model vidí hodnotu</span></h2>
@@ -1868,7 +2012,8 @@ function renderGame() {
   const loadCalcOdd = () => { $("codd").value = store.get(`odd:${GAME.id}:pl:${$("cpl").value}:${$("cmk").value}`) || ""; renderCalc(); };
   $("cpl").onchange = loadCalcOdd; $("cmk").onchange = loadCalcOdd; $("codd").oninput = renderCalc;
   renderMarkets(); renderPlayers(); loadCalcOdd();
-  reveal($("view-game"));
+  initSlider();
+  reveal($("view-game")); interactive($("view-game"));
   document.querySelectorAll('#view-game a[href^="#"]:not([href="#"])').forEach((a) => (a.onclick = (e) => {
     e.preventDefault(); document.getElementById(a.getAttribute("href").slice(1)).scrollIntoView({ behavior: "smooth" });
   }));
