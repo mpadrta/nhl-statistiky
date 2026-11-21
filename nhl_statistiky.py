@@ -651,6 +651,69 @@ def predict_game(g, teams, lg, roster, info):
 
 
 # ---------------------------------------------------------------------------
+#  Mapa střel (play-by-play s pozicemi střel)
+# ---------------------------------------------------------------------------
+_pbp = {}
+_pbp_lock = threading.Lock()
+_shotmaps = {}
+
+
+def load_shots(gid):
+    """Vrátí [(teamId, x, y, gól)] – souřadnice otočené tak, že útočný tým střílí vždy doprava."""
+    with _pbp_lock:
+        if gid in _pbp:
+            return _pbp[gid]
+    try:
+        d = json.loads(http_get(NHL_API + f"gamecenter/{gid}/play-by-play"))
+    except Exception:
+        return []
+    home_id = (d.get("homeTeam") or {}).get("id")
+    out = []
+    for p in d.get("plays", []):
+        if p.get("typeDescKey") not in ("shot-on-goal", "goal"):
+            continue
+        if (p.get("periodDescriptor") or {}).get("periodType") == "SO":
+            continue
+        det = p.get("details") or {}
+        x, y, tid = det.get("xCoord"), det.get("yCoord"), det.get("eventOwnerTeamId")
+        if x is None or y is None or tid is None:
+            continue
+        side = p.get("homeTeamDefendingSide")
+        is_home = tid == home_id
+        attacking_left = (is_home and side == "right") or (not is_home and side == "left")
+        if attacking_left:
+            x, y = -x, -y
+        out.append((tid, x, y, p.get("typeDescKey") == "goal"))
+    if d.get("gameState") in ("FINAL", "OFF"):
+        with _pbp_lock:
+            _pbp[gid] = out
+    return out
+
+
+def shotmap(team, n_games=10):
+    hit = _shotmaps.get(team)
+    if hit and time.time() - hit[0] < REFRESH_SECONDS:
+        return hit[1]
+    recs = LEAGUE.teams.get(team, [])[:n_games]
+    gids = [r["id"] for r in recs]
+    team_id = None
+    for r in recs:
+        g = LEAGUE.games.get(r["id"])
+        if g:
+            team_id = g["home"]["id"] if g["home"]["abbr"] == team else g["away"]["id"]
+            break
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(load_shots, gids))
+    sf, sa = [], []
+    for shots in res:
+        for tid, x, y, goal in shots:
+            (sf if tid == team_id else sa).append([x, y, 1 if goal else 0])
+    data = {"team": team, "games": len(gids), "for": sf, "against": sa}
+    _shotmaps[team] = (time.time(), data)
+    return data
+
+
+# ---------------------------------------------------------------------------
 #  AI chatbot (Google Gemini – bezplatná verze API)
 # ---------------------------------------------------------------------------
 _gem_models = None
@@ -886,6 +949,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({**LEAGUE.overview(), "ai": bool(gemini_key()), "status": LEAGUE.status()})
             return
+        if u.path == "/model/shotmap":
+            team = q.get("team", [""])[0].upper()
+            if not (team.isalpha() and len(team) == 3) or not LEAGUE.ready:
+                self._json({"error": "Data nejsou připravená."}, 400)
+                return
+            self._json(shotmap(team))
+            return
         if u.path == "/model/predict":
             LEAGUE.ensure()
             try:
@@ -1085,6 +1155,70 @@ details.gloss dd { margin: 0; color: #c3cee0; line-height: 1.55; }
 .slider .side span { color: #c7d3e6; font-size: 14px; }
 .slider .dist { margin-top: 14px; }
 .slider .dist svg { width: 100%; height: auto; display: block; }
+/* hřiště */
+.rinkwrap { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, 1fr); gap: 18px; align-items: start; }
+.rinkwrap svg { width: 100%; height: auto; display: block; border-radius: 18px; }
+.shot { animation: dropin .45s cubic-bezier(.2,1.6,.4,1) both; transform-box: fill-box; transform-origin: center; }
+.shot.goal { animation: dropin .45s cubic-bezier(.2,1.6,.4,1) both, glow 1.6s ease-in-out infinite alternate; }
+@keyframes dropin { from { transform: scale(0); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes glow { from { filter: drop-shadow(0 0 0 #fbbf24); } to { filter: drop-shadow(0 0 6px #fbbf24); } }
+.zones div { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px dashed var(--line); }
+.zones b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 30px; }
+/* simulace */
+.simtop { display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: center; }
+.scoreboard { background: #04070d; border: 2px solid #1f2a40; border-radius: 18px; padding: 16px 26px; text-align: center; min-width: 300px;
+  box-shadow: inset 0 0 30px rgba(56,189,248,.08), 0 10px 30px rgba(0,0,0,.4); }
+.scoreboard .digits { font-family: Anton, Impact, sans-serif; font-size: 84px; line-height: 1; color: #ffcf4d; text-shadow: 0 0 18px rgba(255,190,60,.55); letter-spacing: .04em; }
+.scoreboard .tm { display: flex; justify-content: space-between; font-weight: 800; color: #9fb0c8; letter-spacing: .1em; font-size: 13px; }
+.scoreboard small { color: #6f7f99; font-size: 12px; }
+.simstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.simstats div { background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+.simstats b { display: block; font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 38px; line-height: 1.05; }
+.simstats small { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.simgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-top: 16px; }
+.hbar { display: grid; grid-template-columns: 110px 1fr 54px; gap: 8px; align-items: center; margin: 5px 0; font-size: 13.5px; }
+.hbar .b { height: 12px; background: rgba(255,255,255,.06); border-radius: 99px; overflow: hidden; }
+.hbar .b i { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--cyan), var(--violet)); transition: width .25s; }
+.hbar .n { text-align: right; font-weight: 800; font-variant-numeric: tabular-nums; }
+/* porovnání */
+.cmpwrap { display: grid; grid-template-columns: minmax(260px, 420px) 1fr; gap: 22px; align-items: center; }
+.cmpwrap svg { width: 100%; height: auto; }
+.radar-poly { transform-origin: 200px 200px; animation: grow .9s cubic-bezier(.2,1.2,.4,1) both; }
+@keyframes grow { from { transform: scale(0); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.cmprow { margin: 10px 0; }
+.cmprow .lab { font-size: 13px; color: var(--muted); font-weight: 700; margin-bottom: 4px; }
+.cmprow .r { display: grid; grid-template-columns: 1fr 60px; gap: 8px; align-items: center; margin: 3px 0; }
+.cmprow .b { height: 12px; background: rgba(255,255,255,.06); border-radius: 99px; overflow: hidden; }
+.cmprow .b i { display: block; height: 100%; border-radius: 99px; width: 0; transition: width 1s cubic-bezier(.2,.8,.2,1); }
+.cmprow .v { text-align: right; font-weight: 800; font-size: 13.5px; }
+.cmpsel { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.cmpsel select { border-width: 2px; }
+/* tiket */
+#slipbtn { position: fixed; left: 22px; bottom: 22px; z-index: 50; border: none; cursor: pointer; color: #1a1300; font-weight: 900;
+  font-size: 15px; padding: 14px 20px; border-radius: 999px; background: linear-gradient(135deg, #fde68a, var(--gold)); box-shadow: 0 10px 30px rgba(251,191,36,.4); }
+#slipbtn .cnt { background: #1a1300; color: var(--gold); border-radius: 99px; padding: 1px 8px; margin-left: 6px; }
+#slipbtn.bump { animation: bump .5s; }
+@keyframes bump { 30% { transform: scale(1.18) rotate(-4deg); } 60% { transform: scale(.95); } }
+#slip { position: fixed; left: 22px; bottom: 22px; z-index: 60; width: 430px; max-width: calc(100vw - 24px); max-height: calc(100vh - 40px);
+  display: flex; flex-direction: column; background: #0d1527; border: 1px solid rgba(251,191,36,.4); border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,.6); overflow: hidden; }
+#slip header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; background: linear-gradient(135deg, rgba(251,191,36,.25), rgba(251,146,60,.15)); border-bottom: 1px solid var(--line); }
+#slip header b { flex: 1; font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 24px; letter-spacing: .03em; text-transform: uppercase; }
+#slip header button { background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; }
+#slipitems { overflow-y: auto; padding: 10px 14px; flex: 1; }
+.sitem { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; padding: 10px 0; border-bottom: 1px dashed var(--line); }
+.sitem small { display: block; color: var(--muted); font-size: 12px; }
+.sitem input { width: 74px; padding: 6px 8px; text-align: right; }
+.sitem button { background: none; border: none; color: var(--red); font-size: 18px; cursor: pointer; }
+#slipsum { padding: 14px 16px; border-top: 1px solid var(--line); background: rgba(255,255,255,.03); }
+#slipsum .row { display: flex; justify-content: space-between; align-items: center; margin: 5px 0; font-size: 14px; }
+#slipsum .row b { font-size: 17px; }
+#slipsum .big { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 34px; color: var(--gold); }
+.addbtn { background: rgba(251,191,36,.14); border: 1px solid rgba(251,191,36,.45); color: #ffe08a; border-radius: 9px; padding: 5px 10px;
+  font-weight: 800; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.addbtn:hover { background: rgba(251,191,36,.28); }
+.addbtn.done { background: rgba(52,211,153,.15); border-color: rgba(52,211,153,.5); color: var(--green); }
+@media (max-width: 900px) { .rinkwrap, .cmpwrap, .simtop { grid-template-columns: 1fr; } .scoreboard { min-width: 0; } }
+@media (max-width: 720px) { #slipbtn { left: 14px; bottom: 14px; } #slip { left: 6px; bottom: 6px; } .scoreboard .digits { font-size: 64px; } }
 /* top bar */
 .topbar { position: sticky; top: 0; z-index: 30; backdrop-filter: blur(14px); background: rgba(7,11,20,.72);
   border-bottom: 1px solid var(--line); }
@@ -1342,6 +1476,12 @@ td.gold { color: var(--gold); font-weight: 800; }
   </section>
 </div>
 
+<button id="slipbtn">🎫 Můj tiket<span class="cnt" id="slipcnt">0</span></button>
+<div id="slip" class="hidden">
+  <header><span style="font-size:22px">🎫</span><b>Můj tiket</b><button id="slipclose" title="Zavřít">✕</button></header>
+  <div id="slipitems"></div>
+  <div id="slipsum"></div>
+</div>
 <button id="chatbtn">🤖 Zeptej se AI</button>
 <div id="chat" class="hidden">
   <header><span style="font-size:22px">🤖</span><b>AI hokejový analytik<small id="chatctx">Všechny nadcházející zápasy</small></b>
@@ -1680,6 +1820,8 @@ function renderOverview() {
         <li><b>Nahoře vyber den</b>, pod tím uvidíš nejlepší tipy toho dne a pak všechny zápasy. <b>Na zápas klikni</b> a otevře se podrobný rozbor.</li>
         <li><b>🤖 Vpravo dole je AI</b> – můžeš se jí česky zeptat na cokoli k zápasům („kdo dnes dá bod?“).</li>
         <li><b>Běžící pás</b> pod nadpisem = hráči s největší šancí na bod dnes.</li>
+        <li><b>🎫 Vlevo dole je tvůj tiket</b> – v detailu zápasu přidáváš sázky tlačítkem „+ tiket“ a stránka spočítá celkový kurz a šanci.</li>
+        <li>V detailu zápasu najdeš i <b>simulaci zápasu</b>, <b>hřiště se střelami</b> a <b>porovnání hráčů</b>.</li>
       </ul></div></div>
     <div class="sechead"><span class="no">01</span><h2>Hráči dne</h2><span class="hint">největší šance na kanadský bod</span></div>
     <p class="help" style="margin-top:-6px">Každá karta = jeden hráč. <b>Velké žluté číslo</b> = šance, že dá gól nebo asistenci. Dole: šance na gól, kolik střel na branku čekáme
@@ -1789,14 +1931,19 @@ function marketRows() {
 }
 function renderMarkets() {
   const rows = marketRows().filter((r) => r.grp === GS.mkt);
-  $("mkttable").innerHTML = `<thead><tr><th class="left">Sázka</th><th title="Šance podle modelu">Šance (model)</th><th title="1 / šance">Férový kurz</th><th title="Sem napiš kurz z Tipsportu">Kurz sázkovky ✏️</th><th title="Zelená = vyplatí se">Vyplatí se?</th></tr></thead><tbody>` +
+  $("mkttable").innerHTML = `<thead><tr><th class="left">Sázka</th><th title="Šance podle modelu">Šance (model)</th><th title="1 / šance">Férový kurz</th><th title="Sem napiš kurz z Tipsportu">Kurz sázkovky ✏️</th><th title="Zelená = vyplatí se">Vyplatí se?</th><th>Tiket</th></tr></thead><tbody>` +
     rows.map((r) => {
       const saved = store.get(oddKey(r.id));
       const v = saved ?? (r.auto ? r.auto.toFixed(2) : "");
       return `<tr><td class="left">${esc(r.name)}${r.auto ? ' <span class="pill">Tipsport</span>' : ""}</td><td class="gold">${pc(r.p)}</td>
         <td>${fair(r.p)}</td><td><input type="number" step="0.01" min="1" placeholder="např. 1.85" value="${esc(v)}" data-id="${r.id}" data-p="${r.p}"></td>
-        <td class="evcell">${evHtml(r.p, parseFloat(v))}</td></tr>`;
+        <td class="evcell">${evHtml(r.p, parseFloat(v))}</td><td><button class="addbtn" data-add="${r.id}">+ tiket</button></td></tr>`;
     }).join("") + "</tbody>";
+  $("mkttable").querySelectorAll("[data-add]").forEach((b) => (b.onclick = () => {
+    const r = rows.find((x) => x.id === b.dataset.add);
+    const odd = parseFloat(b.closest("tr").querySelector("input").value);
+    addToSlip({ key: `${GAME.id}:${r.id}`, label: r.name, p: r.p, odd }, b);
+  }));
   $("mkttable").querySelectorAll("input").forEach((inp) => (inp.oninput = () => {
     store.set(oddKey(inp.dataset.id), inp.value);
     inp.closest("tr").querySelector(".evcell").innerHTML = evHtml(+inp.dataset.p, parseFloat(inp.value));
@@ -1906,6 +2053,42 @@ function renderGame() {
         <p class="help">Kolik <b>gólů</b> čekáme celkem a za každý tým. Ligový průměr je ${d.league.goals.toFixed(2)} gólu na tým.</p></div>
     </div>
 
+    <div class="sechead"><span class="no">▶</span><h2>Simulace zápasu</h2><span class="hint">počítač odehraje zápas 1000×</span></div>
+    <div class="card">
+      <p class="help" style="margin:0 0 14px">Klikni na <b>„Odehraj zápas 1000×“</b>. Počítač zápas tisíckrát „odehraje“ podle čísel modelu – pokaždé trochu jinak, jako ve skutečnosti.
+        Na světelné tabuli uvidíš, jak běží jednotlivé zápasy, a pod ní, <b>jak často co vyšlo</b>: kolikrát vyhrál který tým, která skóre padala nejčastěji, kolik bylo střel a vyloučení
+        a kteří hráči bodovali nejčastěji. Je to jiný pohled na stejná čísla – čím víc simulací něco vyhraje, tím je to pravděpodobnější.</p>
+      <div class="simtop">
+        <div class="scoreboard"><div class="tm"><span>${H}</span><span>${A}</span></div><div class="digits" id="simscore">0 : 0</div><small id="simnote">zatím neodehráno</small></div>
+        <div><button class="btn primary" id="simbtn" style="font-size:17px;padding:14px 22px">▶ Odehraj zápas 1000×</button>
+          <div class="simstats" style="margin-top:14px">
+            <div><small>Odehráno</small><b id="simn">0</b></div>
+            <div><small>Výhry ${H}</small><b id="simwh" style="color:var(--home)">–</b></div>
+            <div><small>Výhry ${A}</small><b id="simwa" style="color:var(--away)">–</b></div>
+            <div><small>Prodloužení</small><b id="simot">–</b></div>
+          </div></div>
+      </div>
+      <div class="simgrid">
+        <div><b>Nejčastější výsledky</b><div id="simscores" class="help"></div></div>
+        <div><b>Střely celkem</b><div id="simshots"></div><p class="help">Výška sloupce = jak často padl daný počet střel.</p></div>
+        <div><b>Vyloučení celkem</b><div id="simpens"></div></div>
+        <div><b>Kdo nejčastěji bodoval</b><div id="simpl" class="help"></div></div>
+      </div>
+    </div>
+
+    <div class="sechead"><span class="no">◎</span><h2>Hřiště</h2><span class="hint">odkud týmy střílí – posledních 10 zápasů</span></div>
+    <div class="card">
+      <p class="help" style="margin:0 0 12px">Na hřišti je vidět <b>každá střela na branku</b> z posledních 10 zápasů týmu – útočí se vždy <b>doprava na branku</b>.
+        <b>Modré tečky</b> = střely, <b>zlaté zářící</b> = góly. Barevné skvrny = místa, odkud se střílí nejčastěji. Vpravo je, kolik střel jde z blízka a kolik z dálky.
+        Přepni si tým a jestli chceš vidět <b>střely týmu</b>, nebo <b>střely soupeřů proti němu</b> (= jak dobře brání). Tlačítko <b>„Přehrát“</b> střely znovu animuje.</p>
+      <div class="controls" style="margin-top:0">
+        <div class="seg" id="rkteam"><button data-v="${H}" class="on">${H}</button><button data-v="${A}">${A}</button></div>
+        <div class="seg" id="rkmode"><button data-v="for" class="on">Střely týmu</button><button data-v="against">Střely soupeřů</button></div>
+        <button class="btn" id="rkplay">▶ Přehrát</button>
+      </div>
+      <div class="rinkwrap"><div id="rinkbox"><div class="loader"><div class="spinner"></div>Načítám střely…</div></div><div id="rinkzones" class="zones"></div></div>
+    </div>
+
     <div class="sechead"><span class="no">⇆</span><h2>Přes nebo pod?</h2><span class="hint">posuň hranici a sleduj šanci</span></div>
     <div class="card slider">
       <p class="help" style="margin:0 0 12px">Vyber, co tě zajímá, a <b>táhni posuvníkem</b>. Velké číslo = hranice (např. 58.5 střel). Zelený box = šance, že padne <b>víc</b>,
@@ -1919,6 +2102,7 @@ function renderGame() {
         <div class="side under"><div class="fill" id="slfu"></div><small>Pod (míň než hranice)</small><b id="slpu"></b><span id="slfb"></span></div>
       </div>
       <div class="dist" id="sldist"></div>
+      <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap"><button class="addbtn" id="sladdo">+ Na tiket: přes</button><button class="addbtn" id="sladdu">+ Na tiket: pod</button></div>
     </div>
 
     <h2 class="sec" id="trhy">💰 Kurzy a hodnota sázek <span class="hint">zadej kurz z Tipsportu – zelená = model vidí hodnotu</span></h2>
@@ -1941,10 +2125,19 @@ function renderGame() {
       <select id="cpl">${plOpts}</select>
       <select id="cmk">${Object.entries(CALC_MK).map(([k, v]) => `<option value="${k}">${v[0]}</option>`).join("")}</select>
       <input id="codd" type="number" step="0.01" min="1" placeholder="Kurz Tipsport" style="width:150px"></div>
-      <div class="out" id="cout"></div></div>
+      <div class="out" id="cout"></div>
+      <button class="addbtn" id="caddbtn" style="margin-top:12px;font-size:14px;padding:8px 14px">+ Přidat na tiket</button></div>
 
     <div class="sechead" id="hraci"><span class="no">★</span><h2>Hráči zápasu</h2><span class="hint">6 největších šancí na bod</span></div>
     <div class="pcards">${d.players.filter((p) => p.active).slice(0, 6).map((p) => playerCard(p, p.team === H ? d.homeLogo : d.awayLogo)).join("")}</div>
+    <div class="sechead"><span class="no">VS</span><h2>Porovnání hráčů</h2><span class="hint">vyber 2–3 hráče</span></div>
+    <div class="card">
+      <p class="help" style="margin:0 0 12px">Vyber až 3 hráče (i z obou týmů). <b>Pavučinový graf</b> vlevo ukazuje, v čem je kdo silný – čím větší barevná plocha, tím lepší.
+        Každý cíp = jedna vlastnost, okraj grafu = nejlepší hráč v tomto zápase. Vpravo jsou stejná čísla jako pruhy s přesnou hodnotou.</p>
+      <div class="cmpsel" id="cmpsel"></div>
+      <div class="cmpwrap"><div id="radar"></div><div id="cmpbars"></div></div>
+    </div>
+
     <h2 class="sec">🎯 Všichni hráči <span class="hint">klikni na záhlaví pro řazení</span></h2>
     <div class="controls" style="margin-top:0">
       <div class="seg" id="plteam"><button data-v="all" class="on">Oba týmy</button><button data-v="${H}">${H}</button><button data-v="${A}">${A}</button></div>
@@ -2012,12 +2205,250 @@ function renderGame() {
   const loadCalcOdd = () => { $("codd").value = store.get(`odd:${GAME.id}:pl:${$("cpl").value}:${$("cmk").value}`) || ""; renderCalc(); };
   $("cpl").onchange = loadCalcOdd; $("cmk").onchange = loadCalcOdd; $("codd").oninput = renderCalc;
   renderMarkets(); renderPlayers(); loadCalcOdd();
-  initSlider();
+  initSlider(); initSim(); initRink(); initCompare();
+  $("sladdo").onclick = (e) => slAdd(true, e.target); $("sladdu").onclick = (e) => slAdd(false, e.target);
+  $("caddbtn").onclick = (e) => {
+    const p = GAME.players.find((x) => x.id === +$("cpl").value), mk = $("cmk").value;
+    if (!p) return;
+    addToSlip({ key: `${GAME.id}:pl:${p.id}:${mk}`, label: `${p.name} – ${CALC_MK[mk][0]}`, p: CALC_MK[mk][1](p), odd: parseFloat($("codd").value) }, e.target);
+  };
   reveal($("view-game")); interactive($("view-game"));
   document.querySelectorAll('#view-game a[href^="#"]:not([href="#"])').forEach((a) => (a.onclick = (e) => {
     e.preventDefault(); document.getElementById(a.getAttribute("href").slice(1)).scrollIntoView({ behavior: "smooth" });
   }));
 }
+
+// ===================================================================
+//  Simulace zápasu
+// ===================================================================
+function rpois(l) { const L = Math.exp(-l); let k = 0, p = 1; do { k++; p *= Math.random(); } while (p > L); return k - 1; }
+function rnorm() { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+let simRun = 0;
+function initSim() { $("simbtn").onclick = runSim; }
+function histSvg(map, color) {
+  const ks = Object.keys(map).map(Number).sort((a, b) => a - b);
+  if (!ks.length) return "";
+  const lo = ks[0], hi = ks[ks.length - 1], arr = [];
+  for (let k = lo; k <= hi; k++) arr.push([k, map[k] || 0]);
+  const W = 420, H = 120, mx = Math.max(...arr.map((a) => a[1])), bw = W / arr.length;
+  let s = `<svg viewBox="0 0 ${W} ${H + 18}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">`;
+  arr.forEach(([k, v], i) => {
+    const h = (v / mx) * H;
+    s += `<rect x="${i * bw + 1}" y="${H - h}" width="${Math.max(1, bw - 2)}" height="${h}" rx="2" fill="${color}" opacity=".8"><title>${k}: ${v}×</title></rect>`;
+    if (arr.length < 22 || k % 5 === 0) s += `<text x="${i * bw + bw / 2}" y="${H + 14}" font-size="10" fill="#8796ae" text-anchor="middle">${k}</text>`;
+  });
+  return s + "</svg>";
+}
+function runSim() {
+  const d = GAME, H = d.home, A = d.away, my = ++simRun, N = 1000;
+  const gH = d.goals.home, gA = d.goals.away;
+  const sh = d.shots.home, sa = d.shots.away;
+  const pl = d.players.filter((p) => p.active).slice(0, 14);
+  const st = { n: 0, wh: 0, wa: 0, ot: 0, scores: {}, shots: {}, pens: {}, pts: {} };
+  $("simbtn").disabled = true; $("simbtn").textContent = "⏳ Simuluji…";
+  const one = () => {
+    let h = rpois(gH), a = rpois(gA), ot = false;
+    const key = `${h}:${a}`; st.scores[key] = (st.scores[key] || 0) + 1;
+    if (h === a) { ot = true; st.ot++; if (Math.random() < gH / (gH + gA)) h++; else a++; }
+    if (h > a) st.wh++; else st.wa++;
+    const shots = Math.max(0, Math.round((sh.mean ?? sh.exp) + rnorm() * (sh.sd ?? 6))) + Math.max(0, Math.round((sa.mean ?? sa.exp) + rnorm() * (sa.sd ?? 6)));
+    st.shots[shots] = (st.shots[shots] || 0) + 1;
+    const pens = rpois(d.pens.home.exp) + rpois(d.pens.away.exp);
+    st.pens[pens] = (st.pens[pens] || 0) + 1;
+    const goalsReg = { [H]: +key.split(":")[0], [A]: +key.split(":")[1] };
+    pl.forEach((p) => {
+      const expG = p.team === H ? gH : gA, k = goalsReg[p.team] / expG;
+      const prob = 1 - Math.pow(1 - p.pPoint, k);
+      if (Math.random() < prob) st.pts[p.id] = (st.pts[p.id] || 0) + 1;
+    });
+    st.n++;
+    return { h, a, ot, shots, pens };
+  };
+  const frame = () => {
+    if (my !== simRun || !$("simscore")) return;
+    let last;
+    const batch = st.n < 60 ? 2 : st.n < 300 ? 12 : 30;
+    for (let i = 0; i < batch && st.n < N; i++) last = one();
+    $("simscore").textContent = `${last.h} : ${last.a}`;
+    $("simnote").textContent = `simulace č. ${st.n}${last.ot ? " · po prodloužení" : ""} · ${last.shots} střel · ${last.pens} vyloučení`;
+    $("simn").textContent = st.n;
+    $("simwh").textContent = Math.round((st.wh / st.n) * 100) + " %";
+    $("simwa").textContent = Math.round((st.wa / st.n) * 100) + " %";
+    $("simot").textContent = Math.round((st.ot / st.n) * 100) + " %";
+    const top = Object.entries(st.scores).sort((a, b) => b[1] - a[1]).slice(0, 8), mx = top[0][1];
+    $("simscores").innerHTML = top.map(([k, v]) => `<div class="hbar"><span>${H} ${k} ${A}</span><span class="b"><i style="width:${(v / mx) * 100}%"></i></span><span class="n">${Math.round((v / st.n) * 1000) / 10} %</span></div>`).join("");
+    $("simshots").innerHTML = histSvg(st.shots, "#38bdf8");
+    $("simpens").innerHTML = histSvg(st.pens, "#fb923c");
+    const tp = pl.map((p) => [p, st.pts[p.id] || 0]).sort((a, b) => b[1] - a[1]).slice(0, 8), mp = Math.max(1, tp[0][1]);
+    $("simpl").innerHTML = tp.map(([p, v]) => `<div class="hbar"><span>${esc(splitName(p.name)[1])} <small class="muted">${p.team}</small></span><span class="b"><i style="width:${(v / mp) * 100}%;background:linear-gradient(90deg,var(--orange),var(--gold))"></i></span><span class="n">${Math.round((v / st.n) * 100)} %</span></div>`).join("");
+    if (st.n < N) requestAnimationFrame(frame);
+    else { $("simbtn").disabled = false; $("simbtn").textContent = "↻ Odehraj znovu 1000×"; $("simnote").textContent = `hotovo – odehráno ${N} zápasů (poslední výsledek nahoře)`; }
+  };
+  requestAnimationFrame(frame);
+}
+
+// ===================================================================
+//  Hřiště – mapa střel
+// ===================================================================
+const RK = { team: null, mode: "for", data: {} };
+function initRink() {
+  RK.team = GAME.home; RK.mode = "for";
+  segment($("rkteam"), (v) => { RK.team = v; drawRink(); });
+  segment($("rkmode"), (v) => { RK.mode = v; drawRink(); });
+  $("rkplay").onclick = () => drawRink(true);
+  drawRink();
+}
+async function drawRink() {
+  const team = RK.team, box = $("rinkbox");
+  if (!RK.data[team]) {
+    box.innerHTML = `<div class="loader"><div class="spinner"></div>Načítám střely z posledních zápasů…</div>`;
+    try { RK.data[team] = await getJSON("/model/shotmap?team=" + team); }
+    catch (e) { box.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+    if (RK.team !== team) return;
+  }
+  const d = RK.data[team], shots = (RK.mode === "for" ? d.for : d.against).filter((s) => s[0] >= 0);
+  const S = 8, W = 104 * S, Hh = 85 * S, X = (x) => (x + 2) * S, Y = (y) => (42.5 - y) * S;
+  const col = RK.mode === "for" ? tcol(team) : "#f87171";
+  // heat
+  const cell = 6, heat = {};
+  shots.forEach(([x, y]) => { const k = `${Math.floor(x / cell)},${Math.floor((y + 42.5) / cell)}`; heat[k] = (heat[k] || 0) + 1; });
+  const hmax = Math.max(1, ...Object.values(heat));
+  let svg = `<svg viewBox="0 0 ${W} ${Hh}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">
+    <defs><clipPath id="rc"><path d="M${X(0)} ${Y(42.5)} H${X(72)} A${28 * S} ${28 * S} 0 0 1 ${X(100)} ${Y(14.5)} V${Y(-14.5)} A${28 * S} ${28 * S} 0 0 1 ${X(72)} ${Y(-42.5)} H${X(0)} Z"/></clipPath>
+    <radialGradient id="ice" cx="60%" cy="50%" r="80%"><stop offset="0" stop-color="#eef6ff"/><stop offset="1" stop-color="#cfe0f2"/></radialGradient></defs>
+    <g clip-path="url(#rc)"><rect x="0" y="0" width="${W}" height="${Hh}" fill="url(#ice)"/>`;
+  Object.entries(heat).forEach(([k, v]) => {
+    const [cx, cy] = k.split(",").map(Number);
+    svg += `<rect x="${X(cx * cell)}" y="${Y(cy * cell - 42.5 + cell)}" width="${cell * S}" height="${cell * S}" fill="${col}" opacity="${(0.08 + 0.5 * (v / hmax)).toFixed(2)}"/>`;
+  });
+  svg += `<line x1="${X(0)}" x2="${X(0)}" y1="0" y2="${Hh}" stroke="#e11d48" stroke-width="${S}"/>
+    <line x1="${X(25)}" x2="${X(25)}" y1="0" y2="${Hh}" stroke="#2563eb" stroke-width="${S}"/>
+    <line x1="${X(89)}" x2="${X(89)}" y1="0" y2="${Hh}" stroke="#e11d48" stroke-width="3"/>
+    <path d="M${X(89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 0 ${X(89)} ${Y(-4)}" fill="#93c5fd" opacity=".7" stroke="#e11d48" stroke-width="3"/>
+    <rect x="${X(89)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
+    <circle cx="${X(69)}" cy="${Y(22)}" r="${15 * S}" fill="none" stroke="#e11d48" stroke-width="3"/><circle cx="${X(69)}" cy="${Y(-22)}" r="${15 * S}" fill="none" stroke="#e11d48" stroke-width="3"/>
+    <circle cx="${X(69)}" cy="${Y(22)}" r="${S}" fill="#e11d48"/><circle cx="${X(69)}" cy="${Y(-22)}" r="${S}" fill="#e11d48"/>
+    <circle cx="${X(20)}" cy="${Y(22)}" r="${S}" fill="#e11d48"/><circle cx="${X(20)}" cy="${Y(-22)}" r="${S}" fill="#e11d48"/>
+    <path d="M${X(0)} ${Y(15)} A${15 * S} ${15 * S} 0 0 1 ${X(0)} ${Y(-15)}" fill="none" stroke="#2563eb" stroke-width="3"/>`;
+  const dur = Math.min(3200, shots.length * 9);
+  shots.forEach(([x, y, g], i) => {
+    const delay = Math.round((i / Math.max(1, shots.length)) * dur);
+    svg += g ? `<circle class="shot goal" style="animation-delay:${delay}ms,${delay}ms" cx="${X(x)}" cy="${Y(y)}" r="${1.5 * S}" fill="#fbbf24" stroke="#7c4a03" stroke-width="2"><title>Gól</title></circle>`
+             : `<circle class="shot" style="animation-delay:${delay}ms" cx="${X(x)}" cy="${Y(y)}" r="${0.75 * S}" fill="#1e3a8a" opacity=".75"/>`;
+  });
+  svg += `</g><path d="M${X(0)} ${Y(42.5)} H${X(72)} A${28 * S} ${28 * S} 0 0 1 ${X(100)} ${Y(14.5)} V${Y(-14.5)} A${28 * S} ${28 * S} 0 0 1 ${X(72)} ${Y(-42.5)} H${X(0)}" fill="none" stroke="#9fb0c8" stroke-width="5"/>
+    <text x="${X(93)}" y="${Y(-38)}" font-size="22" fill="#475569" text-anchor="middle" font-weight="700">BRANKA →</text></svg>`;
+  box.innerHTML = svg;
+  // zóny
+  const dist = (x, y) => Math.hypot(89 - x, y);
+  const zones = [["Blízko branky (do 6 m)", (s) => dist(s[0], s[1]) < 20], ["Střední vzdálenost (6–12 m)", (s) => dist(s[0], s[1]) >= 20 && dist(s[0], s[1]) < 40], ["Z dálky (přes 12 m)", (s) => dist(s[0], s[1]) >= 40]];
+  const n = shots.length || 1, goals = shots.filter((s) => s[2]).length;
+  $("rinkzones").innerHTML = `<div><span><b style="color:${col}">${shots.length}</b><br><small class="muted">${RK.mode === "for" ? "střel na branku" : "střel soupeřů"} za ${d.games} zápasů (${(shots.length / Math.max(1, d.games)).toFixed(1)} na zápas)</small></span></div>
+    <div><span><b style="color:var(--gold)">${goals}</b><br><small class="muted">gólů · úspěšnost ${((goals / n) * 100).toFixed(1)} %</small></span></div>` +
+    zones.map(([lab, f]) => { const z = shots.filter(f), zg = z.filter((s) => s[2]).length;
+      return `<div><span>${lab}<br><small class="muted">${zg} gólů z ${z.length} střel (${z.length ? ((zg / z.length) * 100).toFixed(0) : 0} % úspěšnost)</small></span><b>${Math.round((z.length / n) * 100)} %</b></div>`; }).join("") +
+    `<p class="help">Procenta vpravo = jaká část střel šla z dané vzdálenosti. Zblízka padá víc gólů, proto týmy, které se dostanou k brance, bývají nebezpečnější.</p>`;
+}
+
+// ===================================================================
+//  Porovnání hráčů
+// ===================================================================
+const CMP = { ids: [] };
+const CMP_COLORS = ["#38bdf8", "#a78bfa", "#fbbf24"];
+const CMP_MET = [
+  ["Šance na bod", (p) => p.pPoint, pc], ["Šance na gól", (p) => p.pGoal, pc], ["Oček. střely", (p) => p.expShots, (v) => num(v, 1)],
+  ["Body na zápas (sezóna)", (p) => (p.gp ? p.pts / p.gp : 0), (v) => num(v)], ["Body v posl. 5", (p) => p.form5, (v) => v], ["Čas na ledě", (p) => p.toi, toi],
+];
+function initCompare() {
+  const act = GAME.players.filter((p) => p.active);
+  const tH = act.find((p) => p.team === GAME.home), tA = act.find((p) => p.team === GAME.away);
+  CMP.ids = [tH?.id, tA?.id, ""].map((x) => x ?? "");
+  const opts = (sel) => `<option value="">– nikdo –</option>` + act.map((p) => `<option value="${p.id}" ${p.id === sel ? "selected" : ""}>${esc(p.name)} (${p.team})</option>`).join("");
+  $("cmpsel").innerHTML = CMP.ids.map((id, i) => `<select data-i="${i}" style="border-color:${CMP_COLORS[i]}">${opts(id)}</select>`).join("");
+  $("cmpsel").querySelectorAll("select").forEach((s) => (s.onchange = () => { CMP.ids[+s.dataset.i] = s.value ? +s.value : ""; drawCompare(); }));
+  drawCompare();
+}
+function drawCompare() {
+  const act = GAME.players.filter((p) => p.active);
+  const sel = CMP.ids.map((id, i) => ({ p: GAME.players.find((x) => x.id === id), c: CMP_COLORS[i] })).filter((x) => x.p);
+  const maxes = CMP_MET.map(([, f]) => Math.max(0.0001, ...act.map(f)));
+  const R = 150, C = 200, n = CMP_MET.length;
+  const pt = (i, r) => [C + r * Math.sin((2 * Math.PI * i) / n), C - r * Math.cos((2 * Math.PI * i) / n)];
+  let svg = `<svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">`;
+  [0.25, 0.5, 0.75, 1].forEach((k) => (svg += `<polygon points="${CMP_MET.map((_, i) => pt(i, R * k).join(",")).join(" ")}" fill="none" stroke="rgba(148,163,184,.2)"/>`));
+  CMP_MET.forEach(([lab], i) => {
+    const [x, y] = pt(i, R), [lx, ly] = pt(i, R + 26);
+    svg += `<line x1="${C}" y1="${C}" x2="${x}" y2="${y}" stroke="rgba(148,163,184,.2)"/><text x="${lx}" y="${ly + 4}" font-size="12" fill="#b8c6dc" text-anchor="middle" font-weight="700">${lab.replace(" (sezóna)", "")}</text>`;
+  });
+  sel.forEach(({ p, c }, si) => {
+    const pts = CMP_MET.map(([, f], i) => pt(i, R * Math.min(1, f(p) / maxes[i])).join(",")).join(" ");
+    svg += `<polygon class="radar-poly" style="animation-delay:${si * 150}ms" points="${pts}" fill="${c}" fill-opacity=".22" stroke="${c}" stroke-width="3"/>`;
+  });
+  $("radar").innerHTML = svg + "</svg>";
+  $("cmpbars").innerHTML = sel.length ? CMP_MET.map(([lab, f, fmt], mi) => `<div class="cmprow"><div class="lab">${lab}</div>` +
+    sel.map(({ p, c }) => `<div class="r"><span class="b" title="${esc(p.name)}"><i data-w="${Math.min(100, (f(p) / maxes[mi]) * 100)}" style="background:${c}"></i></span><span class="v" style="color:${c}">${fmt(f(p))}</span></div>`).join("") + `</div>`).join("") +
+    `<div class="legend">${sel.map(({ p, c }) => `<span><i style="background:${c}"></i>${esc(p.name)}</span>`).join("")}</div>`
+    : `<p class="help">Vyber nahoře aspoň jednoho hráče.</p>`;
+  requestAnimationFrame(() => setTimeout(() => $("cmpbars").querySelectorAll("i[data-w]").forEach((i) => (i.style.width = i.dataset.w + "%")), 40));
+}
+
+// ===================================================================
+//  Můj tiket
+// ===================================================================
+const SLIP = { items: [], stake: 100 };
+try { SLIP.items = JSON.parse(store.get("slip") || "[]"); SLIP.stake = +(store.get("slipstake") || 100); } catch (e) {}
+function saveSlip() { store.set("slip", JSON.stringify(SLIP.items)); store.set("slipstake", String(SLIP.stake)); }
+function addToSlip(it, btn) {
+  const g = GAME;
+  it.gid = g.id; it.match = `${g.home} – ${g.away}`; it.start = g.start;
+  if (!(it.odd > 1)) it.odd = null;
+  const i = SLIP.items.findIndex((x) => x.key === it.key);
+  if (i >= 0) SLIP.items[i] = it; else SLIP.items.push(it);
+  saveSlip(); renderSlip();
+  $("slipbtn").classList.remove("bump"); void $("slipbtn").offsetWidth; $("slipbtn").classList.add("bump");
+  if (btn) { btn.classList.add("done"); btn.textContent = "✓ na tiketu"; }
+}
+function slAdd(over, btn) {
+  const c = slCfg(), line = +$("slrange").value;
+  const p = c.normal ? 1 - ncdf(line, c.mean, c.sd) : 1 - poisCdf(Math.floor(line), c.mean);
+  const label = $("slkind").querySelector("button.on").textContent;
+  addToSlip({ key: `${GAME.id}:sl:${SL.kind}:${over ? "o" : "u"}${line}`, label: `${label} – ${over ? "přes" : "pod"} ${line}`, p: over ? p : 1 - p, odd: null }, btn);
+}
+function renderSlip() {
+  const it = SLIP.items;
+  $("slipcnt").textContent = it.length;
+  if (!it.length) {
+    $("slipitems").innerHTML = `<p class="help">Tiket je prázdný. V detailu zápasu klikni u sázky na <b class="addbtn" style="cursor:default">+ tiket</b> a přidá se sem.
+      Pak sem napiš kurzy z Tipsportu a uvidíš celkový kurz, šanci podle modelu a možnou výhru.</p>`;
+    $("slipsum").innerHTML = ""; return;
+  }
+  $("slipitems").innerHTML = `<p class="help" style="margin:0 0 6px">Ke každé sázce napiš kurz z Tipsportu. ✕ sázku odebere.</p>` + it.map((x, i) => `<div class="sitem">
+    <div><b>${esc(x.label)}</b><small>${esc(x.match)} · model ${pc(x.p)} · férový kurz ${fair(x.p)}</small></div>
+    <input type="number" step="0.01" min="1" placeholder="kurz" value="${x.odd ?? ""}" data-i="${i}">
+    <button data-del="${i}" title="Odebrat">✕</button></div>`).join("");
+  const pAll = it.reduce((a, x) => a * x.p, 1);
+  const haveOdds = it.every((x) => x.odd > 1);
+  const oAll = haveOdds ? it.reduce((a, x) => a * x.odd, 1) : null;
+  const games = new Set(it.map((x) => x.gid));
+  const ev = haveOdds ? pAll * oAll - 1 : null;
+  $("slipsum").innerHTML = `
+    <div class="row"><span>Šance, že vyjde všechno (model)</span><b style="color:var(--gold)">${(pAll * 100).toFixed(pAll < 0.1 ? 1 : 0)} %</b></div>
+    <div class="row"><span>Férový celkový kurz</span><b>${fair(pAll)}</b></div>
+    <div class="row"><span>Celkový kurz Tipsport</span><b>${oAll ? oAll.toFixed(2) : "doplň kurzy"}</b></div>
+    <div class="row"><span>Vyplatí se? (hodnota)</span><b>${ev != null ? evHtml(pAll, oAll) : "–"}</b></div>
+    <div class="row"><span>Vklad (Kč)</span><input type="number" id="slipstake" min="1" value="${SLIP.stake}" style="width:110px;text-align:right"></div>
+    <div class="row"><span>Možná výhra</span><span class="big">${oAll ? Math.round(SLIP.stake * oAll).toLocaleString("cs-CZ") + " Kč" : "–"}</span></div>
+    ${it.length > games.size ? `<p class="help" style="color:var(--orange)">⚠️ Máš víc sázek ze stejného zápasu. Ty spolu souvisí (např. víc gólů = víc bodů hráčů), takže šance podle modelu je jen přibližná.</p>` : ""}
+    <p class="help">Šance, že vyjde celý tiket, je součin šancí jednotlivých sázek – proto s každou další sázkou rychle klesá. Sázej jen to, co si můžeš dovolit prohrát.</p>
+    <button class="btn" id="slipclear" style="margin-top:6px">🗑 Vyprázdnit tiket</button>`;
+  $("slipitems").querySelectorAll("input").forEach((inp) => (inp.onchange = () => { SLIP.items[+inp.dataset.i].odd = parseFloat(inp.value) > 1 ? parseFloat(inp.value) : null; saveSlip(); renderSlip(); }));
+  $("slipitems").querySelectorAll("[data-del]").forEach((b) => (b.onclick = () => { SLIP.items.splice(+b.dataset.del, 1); saveSlip(); renderSlip(); }));
+  $("slipstake").onchange = (e) => { SLIP.stake = Math.max(1, +e.target.value || 100); saveSlip(); renderSlip(); };
+  $("slipclear").onclick = () => { SLIP.items = []; saveSlip(); renderSlip(); };
+}
+$("slipbtn").onclick = () => { $("slip").classList.remove("hidden"); $("slipbtn").classList.add("hidden"); renderSlip(); };
+$("slipclose").onclick = () => { $("slip").classList.add("hidden"); $("slipbtn").classList.remove("hidden"); };
+renderSlip();
 
 // ===================================================================
 //  AI chat
