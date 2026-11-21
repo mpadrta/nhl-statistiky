@@ -151,7 +151,8 @@ class League:
         self.teams = {}  # abbr -> seznam záznamů (nejnovější první)
         self.info = {}  # abbr -> {name, logo}
         self.roster = {}  # abbr -> {"skaters": {id: name}, "goalies": [...]}
-        self.lg = {"shots": 28.5, "goals": 3.05, "pens": 3.4}
+        self.lg = {"shots": 28.5, "goals": 3.05, "pens": 3.4, "hits": 22, "blk": 14, "ppg": 0.7, "ppConv": 0.2}
+        self.backtest = None
         self.preds = {}  # gid -> předpověď
         self.upcoming = []  # nadcházející zápasy
         self.season = None
@@ -262,6 +263,11 @@ class League:
             self.upcoming, self.preds = upcoming, preds
             self.ready = True
             self.updated = time.time()
+        st.update(phase="Počítám zpětný test přesnosti…")
+        try:
+            self.backtest = self.run_backtest(pens)
+        except Exception as e:
+            print("Zpětný test selhal:", e, flush=True)
         st.update(phase="Hotovo", done=st["total"])
         print(f"Data obnovena: {len(self.games)} zápasů, {len(preds)} předpovědí", flush=True)
 
@@ -288,6 +294,76 @@ class League:
                 ids.add(r["gameId"])
             start += len(rows)
         return pens, ids
+
+    # -- zpětný test --------------------------------------------------------------
+    def run_backtest(self, pens, days=14):
+        games = sorted(self.games.values(), key=lambda g: (g["date"] or "", g["id"]))
+        if not games:
+            return None
+        last = datetime.date.fromisoformat(games[-1]["date"])
+        start = (last - datetime.timedelta(days=days - 1)).isoformat()
+        dates = sorted({g["date"] for g in games if g["date"] >= start})
+        rows, bins = [], {}
+        for d in dates:
+            prior = {gid: g for gid, g in self.games.items() if g["date"] < d}
+            if len(prior) < 40:
+                continue
+            teams = build_team_records(prior, pens)
+            lg = league_averages(prior, pens)
+            for g in [x for x in games if x["date"] == d]:
+                H, A = g["home"]["abbr"], g["away"]["abbr"]
+                if len(teams.get(H, [])) < 5 or len(teams.get(A, [])) < 5:
+                    continue
+                gg = {"id": g["id"], "home": H, "away": A, "date": d, "start": d, "odds": {}}
+                try:
+                    p = predict_game(gg, teams, lg, self.roster, self.info)
+                except Exception:
+                    continue
+                hs, as_ = g["home"]["score"], g["away"]["score"]
+                ph_pen = pens.get((g["id"], g["home"]["id"]))
+                pa_pen = pens.get((g["id"], g["away"]["id"]))
+                act_pts = {pl["id"]: pl["pts"] for side in ("home", "away") for pl in g[side]["players"]}
+                preds = [pl for pl in p["players"] if pl["active"] and pl["id"] in act_pts]
+                for pl in preds:
+                    b = min(4, int(pl["pPoint"] * 5))
+                    e = bins.setdefault(b, [0, 0.0, 0])
+                    e[0] += 1
+                    e[1] += pl["pPoint"]
+                    e[2] += 1 if act_pts[pl["id"]] > 0 else 0
+                top3 = sorted(preds, key=lambda x: -x["pPoint"])[:3]
+                rows.append({
+                    "id": g["id"], "date": d, "home": H, "away": A,
+                    "winP": p["win"]["home"], "homeWon": hs > as_, "score": f"{hs}:{as_}", "end": g["end"],
+                    "expShots": p["shots"]["total"]["exp"], "shots": g["home"]["sog"] + g["away"]["sog"],
+                    "expPens": p["pens"]["total"]["exp"], "pens": (ph_pen + pa_pen) if ph_pen is not None and pa_pen is not None else None,
+                    "expGoals": p["goals"]["total"], "goals": hs + as_,
+                    "over55": p["goals"]["totalLines"][1]["over"],
+                    "top3": [{"name": t["name"], "team": t["team"], "p": t["pPoint"], "hit": act_pts[t["id"]] > 0} for t in top3],
+                })
+        if not rows:
+            return None
+        n = len(rows)
+        fav_ok = sum(1 for r in rows if (r["winP"] >= 0.5) == r["homeWon"])
+        conf = [r for r in rows if max(r["winP"], 1 - r["winP"]) >= 0.6]
+        conf_ok = sum(1 for r in conf if (r["winP"] >= 0.5) == r["homeWon"])
+        shots_mae = sum(abs(r["expShots"] - r["shots"]) for r in rows) / n
+        pr = [r for r in rows if r["pens"] is not None]
+        pens_mae = sum(abs(r["expPens"] - r["pens"]) for r in pr) / max(1, len(pr))
+        goals_mae = sum(abs(r["expGoals"] - r["goals"]) for r in rows) / n
+        tops = [t for r in rows for t in r["top3"]]
+        top1 = [r["top3"][0] for r in rows if r["top3"]]
+        brier = sum((r["winP"] - (1 if r["homeWon"] else 0)) ** 2 for r in rows) / n
+        return {
+            "from": dates[0], "to": dates[-1], "games": n,
+            "winner": {"ok": fav_ok, "pct": round(fav_ok / n, 4), "confN": len(conf),
+                       "confPct": round(conf_ok / len(conf), 4) if conf else None, "brier": round(brier, 4)},
+            "shotsMae": round(shots_mae, 2), "pensMae": round(pens_mae, 2), "goalsMae": round(goals_mae, 2),
+            "avgShots": round(sum(r["shots"] for r in rows) / n, 1),
+            "top3": {"n": len(tops), "hit": sum(1 for t in tops if t["hit"]), "expected": round(sum(t["p"] for t in tops), 1)},
+            "top1": {"n": len(top1), "hit": sum(1 for t in top1 if t["hit"]), "expected": round(sum(t["p"] for t in top1), 1)},
+            "calib": [{"bin": b, "n": v[0], "pred": round(v[1] / v[0], 4), "actual": round(v[2] / v[0], 4)} for b, v in sorted(bins.items())],
+            "rows": rows[::-1][:60],
+        }
 
     # -- přehled ---------------------------------------------------------------
     def overview(self):
@@ -322,6 +398,7 @@ def compact_game(box):
                 "num": p.get("sweaterNumber"), "g": p.get("goals") or 0, "a": p.get("assists") or 0, "pts": p.get("points") or 0,
                 "sog": p.get("sog") or 0, "pim": p.get("pim") or 0, "toi": _toi(p.get("toi")),
                 "hits": p.get("hits") or 0, "ppg": p.get("powerPlayGoals") or 0,
+                "blk": p.get("blockedShots") or 0,
             })
         starter = None
         for gk in pst.get("goalies") or []:
@@ -352,6 +429,10 @@ def build_team_records(games, pens):
                 "gf": me["score"], "ga": op["score"], "sf": me["sog"], "sa": op["sog"],
                 "pt": pt, "pd": pd, "end": g["end"],
                 "hits": sum(p["hits"] for p in me["players"]),
+                "hitsA": sum(p["hits"] for p in op["players"]),
+                "blk": sum(p.get("blk", 0) for p in me["players"]),
+                "blkA": sum(p.get("blk", 0) for p in op["players"]),
+                "ppgf": sum(p.get("ppg", 0) for p in me["players"]),
                 "players": me["players"], "starter": me["starter"],
             })
     return teams
@@ -360,12 +441,18 @@ def build_team_records(games, pens):
 def league_averages(games, pens):
     n = len(games) * 2
     if not n:
-        return {"shots": 28.5, "goals": 3.05, "pens": 3.4}
+        return {"shots": 28.5, "goals": 3.05, "pens": 3.4, "hits": 22, "blk": 14, "ppg": 0.7, "ppConv": 0.2}
     shots = sum(g["home"]["sog"] + g["away"]["sog"] for g in games.values()) / n
     goals = sum(g["home"]["score"] + g["away"]["score"] for g in games.values()) / n
     pv = list(pens.values())
     p = sum(pv) / len(pv) if pv else 3.4
-    return {"shots": round(shots, 2), "goals": round(goals, 3), "pens": round(p, 3)}
+    allp = [pl for g in games.values() for side in ("home", "away") for pl in g[side]["players"]]
+    hits = sum(pl["hits"] for pl in allp) / n
+    blk = sum(pl.get("blk", 0) for pl in allp) / n
+    ppg = sum(pl.get("ppg", 0) for pl in allp) / n
+    return {"shots": round(shots, 2), "goals": round(goals, 3), "pens": round(p, 3),
+            "hits": round(max(hits, 1), 2), "blk": round(max(blk, 1), 2), "ppg": round(ppg, 3),
+            "ppConv": round(ppg / max(p, 0.1), 4)}
 
 
 def load_upcoming(info):
@@ -432,7 +519,8 @@ def _shrunk(recs, key, prior, venue=None, k=3.0):
 
 def team_profile(recs, lg):
     pri = {"sf": lg["shots"], "sa": lg["shots"], "gf": lg["goals"], "ga": lg["goals"],
-           "pt": lg["pens"], "pd": lg["pens"]}
+           "pt": lg["pens"], "pd": lg["pens"], "hits": lg.get("hits", 22), "hitsA": lg.get("hits", 22),
+           "blk": lg.get("blk", 14), "blkA": lg.get("blk", 14)}
     prof = {}
     for key, prior in pri.items():
         allv = _shrunk(recs, key, prior, k=3)
@@ -446,6 +534,10 @@ def team_profile(recs, lg):
     else:
         sd = 6.0
     prof["sf_sd"] = _clamp(sd, 4.5, 8.5)
+    ppg_sum = sum(r.get("ppgf", 0) for r in recs)
+    pd_sum = sum(r["pd"] or 0 for r in recs)
+    conv0 = lg.get("ppConv", 0.2)
+    prof["ppConv"] = (ppg_sum + conv0 * 25) / (pd_sum + 25)
 
     def rec_str(rs):
         w = sum(1 for r in rs if r["gf"] > r["ga"])
@@ -526,6 +618,7 @@ def player_projections(team, recs, prof, exp_goals, exp_shots, venue_home, roste
             "gp": len(apps), "g": sum(a[3]["g"] for a in apps), "a": sum(a[3]["a"] for a in apps),
             "pts": sum(a[3]["pts"] for a in apps),
             "pPoint": round(p_point, 4), "expPoints": round(-math.log(max(1e-6, 1 - p_point)), 3),
+            "p2Points": round(1 - (1 - p_point) * (1 - math.log(max(1e-6, 1 - p_point))), 4),
             "pGoal": round(1 - math.exp(-lam_g), 4), "expGoals": round(lam_g, 3),
             "expShots": round(lam_s, 2),
             "p2Shots": round(1 - e * (1 + lam_s), 4),
@@ -608,6 +701,39 @@ def predict_game(g, teams, lg, roster, info):
                player_projections(away, ra, pa, gA, sA, False, rosA.get("skaters", {})))
     players.sort(key=lambda p: (-p["active"], -p["pPoint"]))
 
+    # další trhy: hity, bloky, góly v přesilovce, první gól
+    lh, lb = lg.get("hits", 22), lg.get("blk", 14)
+    hH = ph["hits"]["home"] * pa["hitsA"]["away"] / lh
+    hA = pa["hits"]["away"] * ph["hitsA"]["home"] / lh
+    bH = ph["blk"]["home"] * pa["blkA"]["away"] / lb
+    bA = pa["blk"]["away"] * ph["blkA"]["home"] / lb
+    ppH = ph["ppConv"] * nA
+    ppA = pa["ppConv"] * nH
+    tot = gH + gA
+    p_none = math.exp(-tot)
+    first = {"home": round(gH / tot * (1 - p_none), 4), "away": round(gA / tot * (1 - p_none), 4), "none": round(p_none, 4)}
+    for side_team, gx in ((home, gH), (away, gA)):
+        act = [p for p in players if p["team"] == side_team and p["active"]]
+        sg = sum(p["expGoals"] for p in act) or 1
+        for p in act:
+            p["pFirstGoal"] = round((p["expGoals"] / sg) * (gx / tot) * (1 - p_none), 4)
+    for p in players:
+        p.setdefault("pFirstGoal", 0.0)
+
+    def norm_block(lam, k=1.6, step=2):
+        sd = math.sqrt(max(1.0, k * lam))
+        return {"exp": round(lam, 1), "sd": round(sd, 3), "mean": round(lam, 3),
+                "lines": [{"line": l, "over": round(_nover(l, lam, sd), 4)} for l in _lines(lam, step)]}
+
+    extra = {
+        "hits": {"home": norm_block(hH), "away": norm_block(hA), "total": norm_block(hH + hA, step=3)},
+        "blocks": {"home": norm_block(bH), "away": norm_block(bA), "total": norm_block(bH + bA, step=2)},
+        "ppGoals": {"home": {"exp": round(ppH, 2), "p1": round(1 - math.exp(-ppH), 4)},
+                    "away": {"exp": round(ppA, 2), "p1": round(1 - math.exp(-ppA), 4)},
+                    "total": {"exp": round(ppH + ppA, 2), "lines": [{"line": l, "over": round(_pover(l, ppH + ppA), 4)} for l in (0.5, 1.5, 2.5)]}},
+        "firstGoal": first,
+    }
+
     h2h = [{"date": r["date"], "home": r["home"], "gf": r["gf"], "ga": r["ga"], "sf": r["sf"],
             "sa": r["sa"], "pt": r["pt"], "pd": r["pd"], "end": r["end"]} for r in rh if r["opp"] == away]
 
@@ -647,6 +773,7 @@ def predict_game(g, teams, lg, roster, info):
             away: {"form": pa["form"], "trend": pa["trend"], "why": why(away, home, pa, ph, False, sA, nA, gA), **gi_a},
         },
         "h2h": h2h, "players": players, "games": {"home": len(rh), "away": len(ra)},
+        "extra": extra,
     }
 
 
@@ -711,6 +838,168 @@ def shotmap(team, n_games=10):
     data = {"team": team, "games": len(gids), "for": sf, "against": sa}
     _shotmaps[team] = (time.time(), data)
     return data
+
+
+# ---------------------------------------------------------------------------
+#  LIVE zápasy
+# ---------------------------------------------------------------------------
+_live_cache = {}
+_live_lock = threading.Lock()
+LIVE_TYPES = ("faceoff", "shot-on-goal", "goal", "missed-shot", "blocked-shot", "hit", "penalty", "takeaway", "giveaway")
+
+
+def _live_get(path, ttl):
+    now = time.time()
+    with _live_lock:
+        hit = _live_cache.get(path)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    data = json.loads(http_get(NHL_API + path))
+    with _live_lock:
+        _live_cache[path] = (now, data)
+        if len(_live_cache) > 80:
+            for k in sorted(_live_cache, key=lambda k: _live_cache[k][0])[:40]:
+                del _live_cache[k]
+    return data
+
+
+def live_games():
+    out = []
+    today = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=10)
+    for day in (today.date(), today.date() - datetime.timedelta(days=1)):
+        try:
+            d = _live_get(f"score/{day.isoformat()}", 20)
+        except Exception:
+            continue
+        for g in d.get("games", []):
+            if g.get("gameType") not in (2, 3):
+                continue
+            ht, at = g["homeTeam"], g["awayTeam"]
+            out.append({
+                "id": g["id"], "state": g.get("gameState"), "start": g.get("startTimeUTC"),
+                "home": ht.get("abbrev"), "away": at.get("abbrev"),
+                "homeName": _abbr(ht.get("name")) or ht.get("abbrev"), "awayName": _abbr(at.get("name")) or at.get("abbrev"),
+                "homeLogo": ht.get("darkLogo") or ht.get("logo"), "awayLogo": at.get("darkLogo") or at.get("logo"),
+                "score": [ht.get("score"), at.get("score")], "sog": [ht.get("sog"), at.get("sog")],
+                "period": (g.get("periodDescriptor") or {}).get("number"),
+                "periodType": (g.get("periodDescriptor") or {}).get("periodType"),
+                "clock": g.get("clock"),
+            })
+    order = {"LIVE": 0, "CRIT": 0, "PRE": 1, "FUT": 2, "FINAL": 3, "OFF": 3}
+    seen, res = set(), []
+    for g in sorted(out, key=lambda g: (order.get(g["state"], 4), g["start"] or "")):
+        if g["id"] not in seen:
+            seen.add(g["id"])
+            res.append(g)
+    return {"games": res}
+
+
+def live_game(gid):
+    pbp = _live_get(f"gamecenter/{gid}/play-by-play", 5)
+    try:
+        box = _live_get(f"gamecenter/{gid}/boxscore", 8)
+    except Exception:
+        box = {}
+    ht, at = pbp.get("homeTeam") or {}, pbp.get("awayTeam") or {}
+    ids = {ht.get("id"): ht.get("abbrev"), at.get("id"): at.get("abbrev")}
+    names = {}
+    for r in pbp.get("rosterSpots") or []:
+        names[r.get("playerId")] = (f"{_abbr(r.get('firstName')) or ''} {_abbr(r.get('lastName')) or ''}".strip(),
+                                     r.get("sweaterNumber"), ids.get(r.get("teamId")))
+
+    def nm(pid):
+        n = names.get(pid)
+        return {"id": pid, "name": n[0], "num": n[1]} if n else None
+
+    periods = {}
+    events = []
+    last_sit, last_side = "1551", None
+    for p in pbp.get("plays") or []:
+        t = p.get("typeDescKey")
+        pd = p.get("periodDescriptor") or {}
+        per = pd.get("number") or 0
+        if pd.get("periodType") == "SO":
+            continue
+        det = p.get("details") or {}
+        team = ids.get(det.get("eventOwnerTeamId"))
+        if p.get("situationCode"):
+            last_sit = p["situationCode"]
+        if p.get("homeTeamDefendingSide"):
+            last_side = p["homeTeamDefendingSide"]
+        if t not in LIVE_TYPES:
+            continue
+        if team:
+            st = periods.setdefault(per, {}).setdefault(team, {"g": 0, "sog": 0, "miss": 0, "blk": 0, "hits": 0, "pen": 0, "pim": 0})
+            if t == "goal":
+                st["g"] += 1; st["sog"] += 1
+            elif t == "shot-on-goal":
+                st["sog"] += 1
+            elif t == "missed-shot":
+                st["miss"] += 1
+            elif t == "blocked-shot":
+                st["blk"] += 1  # zblokovaná střela tohoto týmu
+            elif t == "hit":
+                st["hits"] += 1
+            elif t == "penalty":
+                st["pen"] += 1; st["pim"] += det.get("duration") or 0
+        who = None
+        extra = None
+        if t == "goal":
+            who = nm(det.get("scoringPlayerId"))
+            extra = [x for x in (nm(det.get("assist1PlayerId")), nm(det.get("assist2PlayerId"))) if x]
+        elif t in ("shot-on-goal", "missed-shot", "blocked-shot"):
+            who = nm(det.get("shootingPlayerId"))
+        elif t == "hit":
+            who = nm(det.get("hittingPlayerId")); extra = [x for x in (nm(det.get("hitteePlayerId")),) if x]
+        elif t == "penalty":
+            who = nm(det.get("committedByPlayerId"))
+        elif t == "faceoff":
+            who = nm(det.get("winningPlayerId"))
+        elif t in ("takeaway", "giveaway"):
+            who = nm(det.get("playerId"))
+        events.append({
+            "id": p.get("eventId"), "type": t, "per": per, "time": p.get("timeInPeriod"), "team": team,
+            "x": det.get("xCoord"), "y": det.get("yCoord"), "who": who, "extra": extra,
+            "desc": det.get("descKey"), "dur": det.get("duration"), "shotType": det.get("shotType"),
+            "reason": det.get("reason"), "sit": p.get("situationCode"),
+            "score": [det.get("homeScore"), det.get("awayScore")] if t == "goal" else None,
+        })
+    players = {}
+    for key in ("homeTeam", "awayTeam"):
+        pst = (box.get("playerByGameStats") or {}).get(key) or {}
+        ab = (box.get(key) or {}).get("abbrev")
+        sk = []
+        for p in (pst.get("forwards") or []) + (pst.get("defense") or []):
+            sk.append({"id": p.get("playerId"), "name": (names.get(p.get("playerId")) or (_abbr(p.get("name")),))[0],
+                       "num": p.get("sweaterNumber"), "pos": p.get("position"), "g": p.get("goals", 0), "a": p.get("assists", 0),
+                       "pts": p.get("points", 0), "sog": p.get("sog", 0), "pim": p.get("pim", 0), "hits": p.get("hits", 0),
+                       "blk": p.get("blockedShots", 0), "pm": p.get("plusMinus", 0), "toi": _toi(p.get("toi"))})
+        gk = []
+        for p in pst.get("goalies") or []:
+            if _toi(p.get("toi")) > 0:
+                gk.append({"id": p.get("playerId"), "name": (names.get(p.get("playerId")) or (_abbr(p.get("name")),))[0],
+                           "num": p.get("sweaterNumber"), "sa": p.get("shotsAgainst", 0), "sv": p.get("saves", 0),
+                           "ga": p.get("goalsAgainst", 0), "toi": _toi(p.get("toi"))})
+        players[ab] = {"skaters": sk, "goalies": gk}
+    pd = pbp.get("periodDescriptor") or {}
+    pred = LEAGUE.preds.get(gid)
+    pre = None
+    if pred:
+        pre = {"shots": {k: pred["shots"][k]["exp"] for k in ("home", "away", "total")},
+               "pens": {k: pred["pens"][k]["exp"] for k in ("home", "away", "total")},
+               "goals": {k: pred["goals"][k] for k in ("home", "away", "total")},
+               "win": pred["win"],
+               "players": {pl["id"]: {"pPoint": pl["pPoint"], "expShots": pl["expShots"]} for pl in pred["players"]}}
+    return {
+        "id": gid, "state": pbp.get("gameState"), "start": pbp.get("startTimeUTC"), "venue": _abbr(pbp.get("venue")),
+        "period": pd.get("number"), "periodType": pd.get("periodType"), "clock": pbp.get("clock"),
+        "home": {"abbr": ht.get("abbrev"), "name": f"{_abbr(ht.get('placeName')) or ''} {_abbr(ht.get('commonName')) or ''}".strip(),
+                 "logo": ht.get("darkLogo") or ht.get("logo"), "score": ht.get("score"), "sog": ht.get("sog")},
+        "away": {"abbr": at.get("abbrev"), "name": f"{_abbr(at.get('placeName')) or ''} {_abbr(at.get('commonName')) or ''}".strip(),
+                 "logo": at.get("darkLogo") or at.get("logo"), "score": at.get("score"), "sog": at.get("sog")},
+        "situation": last_sit, "homeSide": last_side, "events": events, "periods": periods, "players": players, "pre": pre,
+        "end": (pbp.get("gameOutcome") or {}).get("lastPeriodType"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +1088,10 @@ def _fair(v):
 
 def chat_context(gid=None):
     L = LEAGUE
+    bt = L.backtest
     lines = [f"Ligový průměr na tým a zápas: střely {L.lg['shots']:.1f}, góly {L.lg['goals']:.2f}, vyloučení {L.lg['pens']:.2f}.",
+             (f"Přesnost modelu (zpětný test {bt['games']} zápasů): vítěz trefen v {round(bt['winner']['pct'] * 100)} %, "
+              f"odchylka střel ±{bt['shotsMae']}, vyloučení ±{bt['pensMae']}, top tip na bod vyšel {bt['top1']['hit']}/{bt['top1']['n']}." if bt else ""),
              "NADCHÁZEJÍCÍ ZÁPASY (čas Praha; domácí první):"]
     for g in L.upcoming:
         p = L.preds.get(g["id"])
@@ -831,6 +1123,12 @@ def chat_context(gid=None):
                            (f"Vyloučení {A}", p["pens"]["away"]), ("Vyloučení celkem", p["pens"]["total"])):
             exp = f"očekáváno {blk['exp']}; " if "exp" in blk else ""
             lines.append(f"{label}: {exp}" + "; ".join(f"přes {l['line']} {_p(l['over'])}" for l in blk["lines"]))
+        x = p.get("extra")
+        if x:
+            lines.append(f"Hity: {H} {x['hits']['home']['exp']}, {A} {x['hits']['away']['exp']}, celkem {x['hits']['total']['exp']}; "
+                         f"zblokované střely: {H} {x['blocks']['home']['exp']}, {A} {x['blocks']['away']['exp']}; "
+                         f"gól v přesilovce: {H} {_p(x['ppGoals']['home']['p1'])}, {A} {_p(x['ppGoals']['away']['p1'])}; "
+                         f"první gól: {H} {_p(x['firstGoal']['home'])}, {A} {_p(x['firstGoal']['away'])}.")
         for t in (H, A):
             ti = p["teams"][t]
             gk = next((x for x in ti["goalies"] if x["likely"]), None)
@@ -844,7 +1142,7 @@ def chat_context(gid=None):
         lines.append("Hráči (bod %, gól %, oček. střely, 2+/3+ střely %, body v posl. 5, série, čas na ledě):")
         for pl in [x for x in p["players"] if x["active"]][:30]:
             lines.append(f"  {pl['name']} {pl['team']} {pl['pos']}: bod {_p(pl['pPoint'])} (fér. kurz {_fair(pl['pPoint'])}), "
-                         f"gól {_p(pl['pGoal'])}, střely {pl['expShots']} (2+ {_p(pl['p2Shots'])}, 3+ {_p(pl['p3Shots'])}), "
+                         f"gól {_p(pl['pGoal'])}, 2+ body {_p(pl.get('p2Points', 0))}, první gól {_p(pl.get('pFirstGoal', 0))}, střely {pl['expShots']} (2+ {_p(pl['p2Shots'])}, 3+ {_p(pl['p3Shots'])}), "
                          f"forma {pl['form5']} b., série {pl['streak']}, sezóna {pl['g']}+{pl['a']}={pl['pts']} v {pl['gp']} z.")
     return "\n".join(lines)
 
@@ -949,6 +1247,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({**LEAGUE.overview(), "ai": bool(gemini_key()), "status": LEAGUE.status()})
             return
+        if u.path == "/model/livegames":
+            try:
+                self._json(live_games())
+            except Exception as e:
+                self._json({"error": f"Nepodařilo se načíst zápasy: {e}"}, 502)
+            return
+        if u.path == "/model/live":
+            try:
+                self._json(live_game(int(q.get("id", ["0"])[0])))
+            except Exception as e:
+                self._json({"error": f"Zápas se nepodařilo načíst: {e}"}, 502)
+            return
+        if u.path == "/model/backtest":
+            LEAGUE.ensure()
+            self._json(LEAGUE.backtest or {"loading": True, **LEAGUE.status()})
+            return
+        if u.path == "/manifest.webmanifest":
+            self._send(200, MANIFEST.encode(), "application/manifest+json")
+            return
+        if u.path in ("/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"):
+            self._send(200, ICONS[u.path], "image/png")
+            return
+        if u.path == "/sw.js":
+            self._send(200, SW_JS.encode(), "application/javascript")
+            return
+        if u.path == "/ping":
+            LEAGUE.ensure()
+            self._send(200, b"ok", "text/plain")
+            return
         if u.path == "/model/shotmap":
             team = q.get("team", [""])[0].upper()
             if not (team.isalpha() and len(team) == 3) or not LEAGUE.ready:
@@ -1016,6 +1343,27 @@ class Handler(BaseHTTPRequestHandler):
         self._json(res, 200 if "reply" in res else 503)
 
 
+# Ikony aplikace (PNG, base64)
+import base64 as _b64
+ICONS = {
+    "/icon-192.png": _b64.b64decode("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"),
+    "/icon-512.png": _b64.b64decode("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"),
+    "/apple-touch-icon.png": _b64.b64decode("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"),
+}
+
+MANIFEST = json.dumps({
+    "name": "NHL Predikce", "short_name": "NHL Predikce",
+    "description": "Předpovědi NHL – body, střely, vyloučení, kurzy, live hřiště",
+    "start_url": "/", "display": "standalone", "background_color": "#070b14", "theme_color": "#070b14",
+    "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+              {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}],
+}, ensure_ascii=False)
+
+SW_JS = """self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => self.clients.claim());
+self.addEventListener('fetch', e => {});"""
+
+
 def main():
     LEAGUE.ensure()  # začni stahovat data hned po startu
     if os.environ.get("PORT"):
@@ -1045,6 +1393,14 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NHL Predikce – body, střely, vyloučení, kurzy</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#070b14">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="NHL Predikce">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -1085,7 +1441,9 @@ details.gloss dd { margin: 0; color: #c3cee0; line-height: 1.55; }
 .cine .kicker { color: var(--cyan); font-weight: 800; letter-spacing: .22em; font-size: 13px; text-transform: uppercase; position: relative; }
 .cine h1 { position: relative; font-size: clamp(56px, 9vw, 136px); margin: 14px 0 0; line-height: 1.12; padding-top: .08em;
   background: linear-gradient(180deg, #ffffff 30%, #9fc3ea); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.cine h1 span { display: block; color: transparent; -webkit-text-stroke: 1.5px rgba(255,255,255,.55); background: none; }
+.cine h1 > span:not(.ln) { display: block; color: transparent; -webkit-text-stroke: 1.5px rgba(255,255,255,.55); background: none; }
+.hero2 h1 .ln:nth-child(2) > i { color: transparent; -webkit-text-stroke: 1.5px rgba(255,255,255,.6); }
+.hero2 h1 { background: none; color: #fff; text-shadow: 0 3px 14px rgba(0,0,0,.35); }
 .cine .lead { position: relative; max-width: 720px; font-size: 18px; color: #b9c7dc; line-height: 1.55; margin: 18px 0 0; }
 .counters { position: relative; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; margin-top: 40px;
   border-top: 1px solid var(--line2); }
@@ -1219,6 +1577,82 @@ details.gloss dd { margin: 0; color: #c3cee0; line-height: 1.55; }
 .addbtn.done { background: rgba(52,211,153,.15); border-color: rgba(52,211,153,.5); color: var(--green); }
 @media (max-width: 900px) { .rinkwrap, .cmpwrap, .simtop { grid-template-columns: 1fr; } .scoreboard { min-width: 0; } }
 @media (max-width: 720px) { #slipbtn { left: 14px; bottom: 14px; } #slip { left: 6px; bottom: 6px; } .scoreboard .digits { font-size: 64px; } }
+/* live */
+.livedot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--red); box-shadow: 0 0 0 0 rgba(248,113,113,.7); animation: ping 1.6s infinite; vertical-align: 1px; }
+@keyframes ping { 0% { box-shadow: 0 0 0 0 rgba(248,113,113,.7); } 70% { box-shadow: 0 0 0 9px rgba(248,113,113,0); } 100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); } }
+.lgames { display: flex; gap: 10px; overflow-x: auto; padding: 4px 2px 12px; scrollbar-width: thin; }
+.lg { flex: 0 0 auto; min-width: 190px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; cursor: pointer; }
+.lg.on { border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(56,189,248,.25); }
+.lg .r { display: flex; align-items: center; gap: 8px; font-weight: 800; margin: 3px 0; }
+.lg .r img { width: 24px; height: 24px; } .lg .r span { flex: 1; } .lg .r b { font-size: 18px; }
+.lg small { color: var(--muted); font-size: 12px; font-weight: 600; }
+.lscore { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; padding: 22px; border-radius: 22px;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--hc) 28%, #0b1426), #070b14 50%, color-mix(in srgb, var(--ac) 28%, #0b1426)); border: 1px solid var(--line2); }
+.lscore .t { display: flex; align-items: center; gap: 14px; } .lscore .t.r { flex-direction: row-reverse; text-align: right; }
+.lscore .t img { width: 78px; height: 78px; }
+.lscore .t b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 30px; text-transform: uppercase; display: block; line-height: 1.1; }
+.lscore .t small { color: var(--muted); font-weight: 700; }
+.lscore .mid { text-align: center; }
+.lscore .sc { font-family: Anton, Impact, sans-serif; font-size: 96px; line-height: 1; color: #fff; letter-spacing: .03em; }
+.lscore .sc.flash { animation: goalflash 1.6s ease; }
+@keyframes goalflash { 0%, 100% { color: #fff; text-shadow: none; } 20%, 60% { color: var(--gold); text-shadow: 0 0 30px rgba(251,191,36,.9); transform: scale(1.08); } }
+.lscore .clk { font-weight: 800; font-size: 18px; color: var(--cyan); font-variant-numeric: tabular-nums; }
+.badge { display: inline-block; margin-top: 6px; padding: 4px 10px; border-radius: 99px; font-weight: 800; font-size: 12.5px; }
+.badge.pp { background: rgba(251,191,36,.18); color: var(--gold); animation: ppblink 1.2s ease-in-out infinite alternate; }
+@keyframes ppblink { from { opacity: .6; } to { opacity: 1; } }
+.badge.en { background: rgba(248,113,113,.18); color: var(--red); }
+.rinkstage { perspective: 1500px; margin-top: 16px; }
+.rinkstage .tilt3d { transition: transform .9s cubic-bezier(.2,.8,.2,1); transform-origin: 50% 60%; }
+.rinkstage.d3 .tilt3d { transform: rotateX(46deg) scale(.94); }
+.rinkstage svg { width: 100%; height: auto; display: block; filter: drop-shadow(0 30px 40px rgba(0,0,0,.55)); }
+#puck { transition: transform .55s cubic-bezier(.3,.8,.3,1); }
+.ev { transform-box: fill-box; transform-origin: center; animation: dropin .45s cubic-bezier(.2,1.6,.4,1) both; }
+.ev.goal { animation: dropin .45s cubic-bezier(.2,1.6,.4,1) both, glow 1.4s ease-in-out infinite alternate; }
+.ripple { transform-box: fill-box; transform-origin: center; animation: ripple 1.2s ease-out forwards; }
+@keyframes ripple { from { transform: scale(.3); opacity: .9; } to { transform: scale(3.2); opacity: 0; } }
+.feed { max-height: 520px; overflow-y: auto; }
+.fe { display: grid; grid-template-columns: 54px 26px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px dashed var(--line); font-size: 14px; align-items: start; }
+.fe .tm { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; font-weight: 700; }
+.fe.goal { background: rgba(251,191,36,.08); border-radius: 8px; }
+.fe small { color: var(--muted); display: block; }
+.lfilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+.lfilters label { display: inline-flex; gap: 5px; align-items: center; font-size: 13px; font-weight: 600; color: #c7d3e6;
+  background: rgba(255,255,255,.04); border: 1px solid var(--line); padding: 6px 10px; border-radius: 99px; cursor: pointer; }
+.pace { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.pace div { background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+.pace b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 36px; display: block; line-height: 1.05; }
+.pace small { color: var(--muted); font-size: 12.5px; }
+.lgrid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 16px; margin-top: 16px; }
+.okc { color: var(--green); font-weight: 800; } .noc { color: var(--red); font-weight: 800; }
+.calib svg { width: 100%; height: auto; }
+.bigstat b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 56px; line-height: 1; display: block; }
+.bigstat small { color: var(--muted); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+@media (max-width: 900px) { .lgrid { grid-template-columns: 1fr; } .lscore .sc { font-size: 64px; } .lscore .t img { width: 48px; height: 48px; } .lscore .t b { font-size: 20px; } }
+@media (max-width: 720px) { .lscore { padding: 14px 8px; gap: 6px; } .lscore .t { flex-direction: column !important; text-align: center !important; gap: 4px; } }
+/* pohyblivý hero */
+.hero2 { min-height: 86vh; display: flex; flex-direction: column; justify-content: flex-end; cursor: none; }
+.hero2 .stage3d { position: absolute; inset: 0; perspective: 1200px; pointer-events: none; }
+.hero2 #icecv { position: absolute; inset: -6% -4%; width: 108%; height: 112%; transform-origin: 50% 80%; will-change: transform; }
+.hero2 #frost { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; mix-blend-mode: screen; }
+.hero2 .backword { position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%); font-family: Anton, Impact, sans-serif;
+  font-size: clamp(160px, 30vw, 460px); line-height: 1; color: transparent; -webkit-text-stroke: 2px rgba(255,255,255,.09); letter-spacing: .02em;
+  pointer-events: none; white-space: nowrap; will-change: transform; user-select: none; }
+.hero2 > *:not(.stage3d):not(#frost):not(.backword):not(.spot) { position: relative; z-index: 3; }
+.hero2 h1 .ln { display: block; overflow: hidden; padding-top: .08em; margin-top: -.08em; }
+.hero2 h1 .ln > i { display: block; font-style: normal; transform: translateY(110%); animation: lineup 1s cubic-bezier(.2,.9,.2,1) forwards; }
+.hero2 h1 .ln:nth-child(2) > i { animation-delay: .15s; }
+@keyframes lineup { to { transform: none; } }
+.hero2 .kicker, .hero2 .lead, .hero2 .counters, .hero2 .daytabs, .hero2 .hint2 { opacity: 0; animation: fadeup .9s ease forwards .45s; }
+@keyframes fadeup { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+.hero2 .hint2 { color: #9fb0c8; font-size: 13px; font-weight: 600; margin-top: 10px; letter-spacing: .02em; }
+.hero2 .hint2 b { color: #fff; }
+#cur { position: fixed; left: 0; top: 0; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 2px solid rgba(255,255,255,.85); border-radius: 50%;
+  pointer-events: none; z-index: 200; mix-blend-mode: difference; transition: width .2s, height .2s, margin .2s, background .2s; display: none; }
+#cur.big { width: 64px; height: 64px; margin: -32px 0 0 -32px; background: rgba(255,255,255,.9); }
+#cur.on { display: block; }
+.magnet { transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+@media (hover: none) { .hero2 { cursor: auto; } }
+@media (prefers-reduced-motion: reduce) { .hero2 h1 .ln > i, .hero2 .kicker, .hero2 .lead, .hero2 .counters, .hero2 .daytabs { animation: none; opacity: 1; transform: none; } }
 /* top bar */
 .topbar { position: sticky; top: 0; z-index: 30; backdrop-filter: blur(14px); background: rgba(7,11,20,.72);
   border-bottom: 1px solid var(--line); }
@@ -1445,17 +1879,22 @@ td.gold { color: var(--gold); font-weight: 800; }
 </head>
 <body>
 <div id="progress"></div>
+<div id="cur"></div>
 <div class="topbar"><div class="wrap">
   <a class="brand" href="#"><span class="puck">🏒</span><span>NHL Predikce<small>body · střely · vyloučení · kurzy</small></span></a>
   <nav class="nav">
-    <a href="#" id="nav-over" class="on">🔮 Zápasy a předpovědi</a>
-    <a href="#statistiky" id="nav-stats">📊 Statistiky týmů</a>
+    <a href="#" id="nav-over" class="on">🔮 Předpovědi</a>
+    <a href="#live" id="nav-live"><span class="livedot"></span> Live</a>
+    <a href="#presnost" id="nav-acc">🎯 Přesnost</a>
+    <a href="#statistiky" id="nav-stats">📊 Statistiky</a>
   </nav>
 </div></div>
 
 <div class="wrap">
   <section id="view-over"></section>
   <section id="view-game" class="hidden"></section>
+  <section id="view-live" class="hidden"></section>
+  <section id="view-acc" class="hidden"></section>
   <section id="view-stats" class="hidden">
     <div class="thead" style="margin-top:26px"><img id="slogo" alt=""><div><h1 class="page" id="stitle" style="margin:0">Statistiky týmu</h1><div class="sub" id="ssub"></div></div></div>
     <div class="controls">
@@ -1607,9 +2046,21 @@ window.addEventListener("scroll", () => {
   const cine = document.getElementById("cine");
   if (cine && !cine.closest(".hidden")) {
     const y = Math.min(window.scrollY, 900);
-    cine.querySelector("h1").style.transform = `translateY(${y * 0.35}px)`;
+    const h1 = cine.querySelector("h1");
+    if (cine.classList.contains("hero2")) {
+      const lns = h1.querySelectorAll(".ln");
+      if (lns[0]) lns[0].style.transform = `translateX(${-y * 0.5}px)`;
+      if (lns[1]) lns[1].style.transform = `translateX(${y * 0.5}px)`;
+      h1.style.opacity = 1 - y / 650;
+      const bw = document.getElementById("backword");
+      if (bw) bw.style.transform = `translate(-50%, -50%) scale(${1 + y / 500})`, (bw.style.opacity = 1 - y / 600);
+      const cv = document.getElementById("icecv");
+      if (cv) cv.style.transform = `rotateX(${Math.min(55, y / 10)}deg) translateY(${y * 0.15}px)`;
+    } else {
+      h1.style.transform = `translateY(${y * 0.35}px)`;
+      h1.style.opacity = 1 - y / 700;
+    }
     cine.querySelector(".lead").style.transform = `translateY(${y * 0.2}px)`;
-    cine.querySelector("h1").style.opacity = 1 - y / 700;
   }
 }, { passive: true });
 let SL = { kind: "shots.total" };
@@ -1618,6 +2069,7 @@ function slCfg() {
   const d = GAME;
   if (grp === "shots") { const b = d.shots[side]; return { normal: true, mean: b.mean ?? b.exp, sd: b.sd ?? 6, lab: "střel", step: 1 }; }
   if (grp === "goals") return { normal: false, mean: d.goals.total, lab: "gólů" };
+  if (grp === "hits" || grp === "blocks") { const b = d.extra[grp][side]; return { normal: true, mean: b.mean, sd: b.sd, lab: grp === "hits" ? "hitů" : "bloků" }; }
   return { normal: false, mean: d.pens[side].exp, lab: "vyloučení" };
 }
 function initSlider() {
@@ -1655,6 +2107,148 @@ function updateSlider() {
   svg += `<line x1="${lx}" x2="${lx}" y1="0" y2="${H}" stroke="#fbbf24" stroke-width="3"/></svg>`;
   $("sldist").innerHTML = svg;
 }
+
+// ---------- pohyblivý hero: led, puk, námraza ----------
+let HERO = null;
+function initHero2() {
+  if (HERO) { HERO.stop(); HERO = null; }
+  const sec = document.getElementById("cine"), cv = document.getElementById("icecv"), fr = document.getElementById("frost");
+  if (!sec || !cv || !fr || !sec.classList.contains("hero2")) return;
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const ctx = cv.getContext("2d"), fx = fr.getContext("2d");
+  const DPR = Math.min(1.5, window.devicePixelRatio || 1);
+  let W = 0, H = 0, FW = 0, FH = 0, frostTex = null, run = true, visible = true, raf = 0, t0 = performance.now();
+  const trail = document.createElement("canvas"), tx = trail.getContext("2d");
+  const mouse = { x: 0, y: 0, active: false };
+  const puck = { x: 0, y: 0, vx: 0, vy: 0, free: 0 };
+  const parts = [], snow = [];
+  function size() {
+    const r = cv.getBoundingClientRect(), rf = sec.getBoundingClientRect();
+    W = Math.max(10, r.width); H = Math.max(10, r.height); FW = rf.width; FH = rf.height;
+    for (const [c, w, h] of [[cv, W, H], [trail, W, H], [fr, FW, FH]]) { c.width = w * DPR; c.height = h * DPR; }
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0); tx.setTransform(DPR, 0, 0, DPR, 0, 0); fx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    if (!puck.x) { puck.x = W * 0.62; puck.y = H * 0.55; }
+    // textura námrazy
+    frostTex = document.createElement("canvas"); frostTex.width = FW * DPR; frostTex.height = FH * DPR;
+    const f = frostTex.getContext("2d"); f.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const g = f.createLinearGradient(0, 0, 0, FH); g.addColorStop(0, "rgba(190,220,255,.10)"); g.addColorStop(1, "rgba(190,220,255,.03)");
+    f.fillStyle = g; f.fillRect(0, 0, FW, FH);
+    for (let i = 0; i < (FW * FH) / 900; i++) { f.fillStyle = `rgba(255,255,255,${Math.random() * 0.22})`; f.fillRect(Math.random() * FW, Math.random() * FH, 1.4, 1.4); }
+    f.strokeStyle = "rgba(255,255,255,.09)"; f.lineWidth = 1;
+    for (let i = 0; i < 70; i++) { // krystaly
+      let x = Math.random() * FW, y = Math.random() * FH, a = Math.random() * 6.28;
+      for (let j = 0; j < 7; j++) { const l = 20 + Math.random() * 60; f.beginPath(); f.moveTo(x, y); x += Math.cos(a) * l; y += Math.sin(a) * l; f.lineTo(x, y); f.stroke();
+        for (let k = -1; k <= 1; k += 2) { f.beginPath(); f.moveTo(x, y); f.lineTo(x + Math.cos(a + k * 0.7) * l * 0.35, y + Math.sin(a + k * 0.7) * l * 0.35); f.stroke(); }
+        a += (Math.random() - 0.5) * 1.2; }
+    }
+    fx.clearRect(0, 0, FW, FH); fx.drawImage(frostTex, 0, 0, FW, FH);
+    for (let i = 0; i < 70; i++) snow.push({ x: Math.random() * W, y: Math.random() * H, r: Math.random() * 1.8 + 0.4, v: Math.random() * 0.4 + 0.1 });
+    snow.length = Math.min(snow.length, 90);
+  }
+  function drawRink(t) {
+    const hc = "#0ea5e9";
+    ctx.clearRect(0, 0, W, H);
+    const g = ctx.createRadialGradient(W * 0.6, H * 0.4, 10, W * 0.5, H * 0.5, Math.max(W, H) * 0.8);
+    g.addColorStop(0, "#16345e"); g.addColorStop(0.5, "#0b1a33"); g.addColorStop(1, "#060a14"); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // rink lines
+    const rx = W * 0.06, ry = H * 0.12, rw = W * 0.88, rh = H * 0.76, rr = rh * 0.32;
+    ctx.save(); ctx.globalAlpha = 0.55; ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(207,230,255,.55)"; ctx.beginPath(); ctx.roundRect(rx, ry, rw, rh, rr); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,77,94,.7)"; ctx.lineWidth = 6; ctx.beginPath(); ctx.moveTo(W / 2, ry); ctx.lineTo(W / 2, ry + rh); ctx.stroke();
+    ctx.strokeStyle = "rgba(77,163,255,.75)"; ctx.lineWidth = 7;
+    [0.36, 0.64].forEach((k) => { ctx.beginPath(); ctx.moveTo(rx + rw * k, ry); ctx.lineTo(rx + rw * k, ry + rh); ctx.stroke(); });
+    ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(W / 2, H / 2, rh * 0.2, 0, 6.29); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,77,94,.55)";
+    [[0.2, 0.33], [0.2, 0.67], [0.8, 0.33], [0.8, 0.67]].forEach(([a, b]) => { ctx.beginPath(); ctx.arc(rx + rw * a, ry + rh * b, rh * 0.15, 0, 6.29); ctx.stroke(); });
+    ctx.restore();
+    // pulzující světla stadionu
+    for (let i = 0; i < 5; i++) {
+      const lx = W * (0.1 + i * 0.2), a = 0.05 + 0.04 * Math.sin(t / 900 + i);
+      const lg = ctx.createRadialGradient(lx, -40, 0, lx, -40, H * 0.9); lg.addColorStop(0, `rgba(160,210,255,${a})`); lg.addColorStop(1, "rgba(160,210,255,0)");
+      ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
+    }
+    ctx.drawImage(trail, 0, 0, W, H);
+    // sníh / ledová tříšť ve vzduchu
+    ctx.fillStyle = "rgba(255,255,255,.55)";
+    snow.forEach((p) => { p.y -= p.v; p.x += Math.sin((t / 1000) + p.r) * 0.2; if (p.y < -5) { p.y = H + 5; p.x = Math.random() * W; } ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); });
+    // částice
+    for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.x += p.vx; p.y += p.vy; p.vx *= 0.94; p.vy *= 0.94; p.life -= 0.025;
+      if (p.life <= 0) { parts.splice(i, 1); continue; } ctx.fillStyle = `rgba(220,240,255,${p.life})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); }
+    // puk
+    const sp = Math.hypot(puck.vx, puck.vy);
+    if (sp > 6) { ctx.strokeStyle = "rgba(56,189,248,.35)"; ctx.lineWidth = 10; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(puck.x, puck.y); ctx.lineTo(puck.x - puck.vx * 4, puck.y - puck.vy * 4); ctx.stroke(); }
+    ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.beginPath(); ctx.ellipse(puck.x + 4, puck.y + 9, 22, 9, 0, 0, 6.29); ctx.fill();
+    ctx.fillStyle = "#0b0f17"; ctx.beginPath(); ctx.ellipse(puck.x, puck.y + 5, 20, 9, 0, 0, 6.29); ctx.fill(); ctx.fillRect(puck.x - 20, puck.y - 1, 40, 6);
+    const pg = ctx.createLinearGradient(puck.x - 20, puck.y - 9, puck.x + 20, puck.y + 9); pg.addColorStop(0, "#3a4250"); pg.addColorStop(1, "#111722");
+    ctx.fillStyle = pg; ctx.beginPath(); ctx.ellipse(puck.x, puck.y - 1, 20, 9, 0, 0, 6.29); ctx.fill();
+  }
+  function step() {
+    const tx0 = mouse.active ? mouse.x : W * 0.62 + Math.cos(performance.now() / 1700) * W * 0.22;
+    const ty0 = mouse.active ? mouse.y : H * 0.55 + Math.sin(performance.now() / 1300) * H * 0.18;
+    const px = puck.x, py = puck.y;
+    if (puck.free > 0) { puck.free--; } else { puck.vx += (tx0 - puck.x) * 0.012; puck.vy += (ty0 - puck.y) * 0.012; }
+    puck.vx *= puck.free > 0 ? 0.985 : 0.88; puck.vy *= puck.free > 0 ? 0.985 : 0.88;
+    puck.x += puck.vx; puck.y += puck.vy;
+    const m = 24;
+    if (puck.x < m || puck.x > W - m) { puck.vx *= -0.8; puck.x = Math.max(m, Math.min(W - m, puck.x)); burst(puck.x, puck.y, 10); }
+    if (puck.y < m || puck.y > H - m) { puck.vy *= -0.8; puck.y = Math.max(m, Math.min(H - m, puck.y)); burst(puck.x, puck.y, 10); }
+    // stopa bruslí
+    tx.globalCompositeOperation = "destination-out"; tx.fillStyle = "rgba(0,0,0,.012)"; tx.fillRect(0, 0, W, H);
+    tx.globalCompositeOperation = "source-over"; tx.strokeStyle = "rgba(210,235,255,.22)"; tx.lineWidth = 2; tx.lineCap = "round";
+    const nx = -(puck.y - py), ny = puck.x - px, nl = Math.hypot(nx, ny) || 1;
+    [-7, 7].forEach((o) => { tx.beginPath(); tx.moveTo(px + (nx / nl) * o, py + (ny / nl) * o); tx.lineTo(puck.x + (nx / nl) * o, puck.y + (ny / nl) * o); tx.stroke(); });
+    if (Math.hypot(puck.vx, puck.vy) > 9 && Math.random() < 0.5) burst(puck.x, puck.y, 2);
+  }
+  function burst(x, y, n) { for (let i = 0; i < n; i++) { const a = Math.random() * 6.28, v = Math.random() * 5 + 1; parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: Math.random() * 2.2 + 0.6, life: 1 }); } }
+  function melt() {
+    // námraza pomalu znovu narůstá
+    if ((melt.n = (melt.n || 0) + 1) % 5 === 0) { fx.globalCompositeOperation = "source-over"; fx.globalAlpha = 0.05; fx.drawImage(frostTex, 0, 0, FW, FH); fx.globalAlpha = 1; }
+    if (!mouse.active) return;
+    const r = sec.getBoundingClientRect(), c = cv.getBoundingClientRect();
+    const x = mouse.x + (c.left - r.left), y = mouse.y + (c.top - r.top);
+    fx.globalCompositeOperation = "destination-out";
+    const g = fx.createRadialGradient(x, y, 0, x, y, 110); g.addColorStop(0, "rgba(0,0,0,.35)"); g.addColorStop(1, "rgba(0,0,0,0)");
+    fx.fillStyle = g; fx.beginPath(); fx.arc(x, y, 110, 0, 6.29); fx.fill();
+    fx.globalCompositeOperation = "source-over";
+  }
+  function loop(t) {
+    if (!run) return;
+    if (visible && !document.hidden) { step(); drawRink(t); melt(); }
+    raf = requestAnimationFrame(loop);
+  }
+  const toLocal = (e) => { const r = cv.getBoundingClientRect(); const p = e.touches ? e.touches[0] : e; mouse.x = p.clientX - r.left; mouse.y = p.clientY - r.top; mouse.active = true; };
+  const onMove = (e) => toLocal(e);
+  const onLeave = () => (mouse.active = false);
+  const onClick = (e) => {
+    if (e.target.closest("button, a, select, input")) return;
+    toLocal(e);
+    const a = Math.atan2(mouse.y - puck.y, mouse.x - puck.x) + Math.PI + (Math.random() - 0.5) * 0.6;
+    puck.vx = Math.cos(a) * 34; puck.vy = Math.sin(a) * 34; puck.free = 45; burst(puck.x, puck.y, 26);
+  };
+  sec.addEventListener("mousemove", onMove); sec.addEventListener("touchmove", onMove, { passive: true });
+  sec.addEventListener("mouseleave", onLeave); sec.addEventListener("touchend", onLeave);
+  sec.addEventListener("click", onClick);
+  const ro = new ResizeObserver(() => size()); ro.observe(sec);
+  const io = new IntersectionObserver((e) => (visible = e[0].isIntersecting)); io.observe(sec);
+  size();
+  if (reduce) { step(); drawRink(0); } else raf = requestAnimationFrame(loop);
+  HERO = { stop() { run = false; cancelAnimationFrame(raf); ro.disconnect(); io.disconnect(); } };
+}
+// vlastní kurzor + magnetická tlačítka
+(function () {
+  if (matchMedia("(hover: none)").matches) return;
+  const c = $("cur"); let x = 0, y = 0, cx = 0, cy = 0;
+  addEventListener("mousemove", (e) => { x = e.clientX; y = e.clientY; c.classList.add("on");
+    const hot = e.target.closest && e.target.closest("button, a, .mcard, .pcard, .lg, select, .lrow");
+    c.classList.toggle("big", !!hot);
+    const mag = e.target.closest && e.target.closest(".btn, .nav a");
+    document.querySelectorAll(".magnet").forEach((m) => { if (m !== mag) { m.style.transform = ""; m.classList.remove("magnet"); } });
+    if (mag) { const r = mag.getBoundingClientRect(); mag.classList.add("magnet");
+      mag.style.transform = `translate(${(e.clientX - r.left - r.width / 2) * 0.25}px, ${(e.clientY - r.top - r.height / 2) * 0.35}px)`; }
+  });
+  addEventListener("mouseout", (e) => { if (!e.relatedTarget) c.classList.remove("on"); });
+  (function f() { cx += (x - cx) * 0.22; cy += (y - cy) * 0.22; c.style.transform = `translate(${cx}px, ${cy}px)`; requestAnimationFrame(f); })();
+})();
 
 let revealObs = null;
 function reveal(root) {
@@ -1732,15 +2326,26 @@ function route() {
   const h = location.hash;
   const game = h.startsWith("#zapas-") ? +h.slice(7) : null;
   const stats = h === "#statistiky";
-  $("view-over").classList.toggle("hidden", !!game || stats);
+  const live = h === "#live" || h.startsWith("#live-");
+  const acc = h === "#presnost";
+  const over = !game && !stats && !live && !acc;
+  $("view-over").classList.toggle("hidden", !over);
   $("view-game").classList.toggle("hidden", !game);
   $("view-stats").classList.toggle("hidden", !stats);
-  $("nav-over").classList.toggle("on", !stats);
+  $("view-live").classList.toggle("hidden", !live);
+  $("view-acc").classList.toggle("hidden", !acc);
+  $("nav-over").classList.toggle("on", over || !!game);
   $("nav-stats").classList.toggle("on", stats);
+  $("nav-live").classList.toggle("on", live);
+  $("nav-acc").classList.toggle("on", acc);
   CHAT.gameId = game;
   updateChatCtx();
+  if (!live) stopLive();
+  if (!over && HERO) { HERO.stop(); HERO = null; }
   if (stats) initStats();
   else if (game) openGame(game);
+  else if (live) openLive(h.startsWith("#live-") ? +h.slice(6) : null);
+  else if (acc) loadAcc();
   else loadOverview();
   window.scrollTo(0, 0);
 }
@@ -1797,9 +2402,11 @@ function renderOverview() {
   const seen = new Set();
   const cards = [...all].sort((a, b) => b.pPoint - a.pPoint).filter((p) => !seen.has(p.id) && seen.add(p.id)).slice(0, 8);
   el.innerHTML = `
-    <section class="cine" id="cine">${RINK}<div class="spot"></div>
+    <section class="cine hero2" id="cine">
+      <div class="stage3d"><canvas id="icecv"></canvas></div><canvas id="frost"></canvas>
+      <div class="backword" id="backword">NHL</div>
       <div class="kicker">NHL · předpovědi · ${dayIso ? fmtDay(dayIso) : ""}</div>
-      <h1 class="display">Hokejová noc<span>v číslech</span></h1>
+      <h1 class="display"><span class="ln"><i>Hokejová noc</i></span><span class="ln"><i>v číslech</i></span></h1>
       <p class="lead">Model prošel ${(OV.status?.total || 0)} odehraných zápasů sezóny a spočítal, kdo dá bod, kolik padne střel, gólů a vyloučení
         ${best ? `– největší šanci na bod má dnes <b style="color:#fff">${esc(best.name)}</b> (${pc(best.pPoint)}).` : "."}</p>
       <div class="counters">
@@ -1809,6 +2416,7 @@ function renderOverview() {
         <div><b data-count="${Math.round(sum((g) => g.pens.total))}">0</b><small>očekávaných vyloučení</small></div>
       </div>
       <p class="help" style="position:relative">Čísla nahoře jsou součty za všechny zápasy vybraného dne. Den přepneš tlačítky níže.</p>
+      <div class="hint2">🏒 Hýbej myší (na mobilu prstem) – <b>puk jede za tebou</b> a led pod ním taje. <b>Klikni</b> a puk vystřelí.</div>
       <div class="seg daytabs" id="days">${days.map(([k, iso]) => `<button data-v="${k}" class="${k === ovDay ? "on" : ""}">${fmtDay(iso)}</button>`).join("")}</div>
     </section>
     ${mq ? `<div class="marquee"><div class="track">${mq}${mq}</div></div>` : ""}
@@ -1822,6 +2430,8 @@ function renderOverview() {
         <li><b>Běžící pás</b> pod nadpisem = hráči s největší šancí na bod dnes.</li>
         <li><b>🎫 Vlevo dole je tvůj tiket</b> – v detailu zápasu přidáváš sázky tlačítkem „+ tiket“ a stránka spočítá celkový kurz a šanci.</li>
         <li>V detailu zápasu najdeš i <b>simulaci zápasu</b>, <b>hřiště se střelami</b> a <b>porovnání hráčů</b>.</li>
+        <li><b>🔴 Live</b> nahoře = zápasy, které se právě hrají, na 3D hřišti s pukem. <b>🎯 Přesnost</b> = jak se modelu dařilo v odehraných zápasech.</li>
+        <li><b>📱 Na mobilu</b> si web můžeš dát na plochu jako aplikaci: v iPhonu Safari → tlačítko Sdílet → <b>Přidat na plochu</b>; v Androidu Chrome → menu ⋮ → <b>Přidat na plochu / Nainstalovat aplikaci</b>.</li>
       </ul></div></div>
     <div class="sechead"><span class="no">01</span><h2>Hráči dne</h2><span class="hint">největší šance na kanadský bod</span></div>
     <p class="help" style="margin-top:-6px">Každá karta = jeden hráč. <b>Velké žluté číslo</b> = šance, že dá gól nebo asistenci. Dole: šance na gól, kolik střel na branku čekáme
@@ -1884,7 +2494,7 @@ function renderOverview() {
       Kurzy na vítěze (včetně prodloužení) jsou z Tipsportu přes oficiální NHL API. Data se obnovují každých 15 minut.
       Je to odhad, ne jistota – model neví o čerstvých zraněních a sestavách. Sázej jen to, co si můžeš dovolit prohrát.</div>`;
   segment($("days"), (v) => { ovDay = v; renderOverview(); });
-  reveal(el); interactive(el);
+  reveal(el); interactive(el); initHero2();
   el.querySelectorAll("[data-go]").forEach((c) => (c.onclick = () => (location.hash = "zapas-" + c.dataset.go)));
 }
 
@@ -1927,6 +2537,20 @@ function marketRows() {
   ou("pens", "Vyloučení celkem", d.pens.total.lines);
   ou("pens", `Vyloučení ${H}`, d.pens.home.lines);
   ou("pens", `Vyloučení ${A}`, d.pens.away.lines);
+  const x = d.extra;
+  if (x) {
+    ou("hits", "Hity celkem", x.hits.total.lines); ou("hits", `Hity ${H}`, x.hits.home.lines); ou("hits", `Hity ${A}`, x.hits.away.lines);
+    ou("blocks", "Zblokované střely celkem", x.blocks.total.lines); ou("blocks", `Bloky ${H}`, x.blocks.home.lines); ou("blocks", `Bloky ${A}`, x.blocks.away.lines);
+    rows.push({ grp: "pp", id: "pp:h", name: `${H} dá gól v přesilovce`, p: x.ppGoals.home.p1 });
+    rows.push({ grp: "pp", id: "pp:hn", name: `${H} nedá gól v přesilovce`, p: 1 - x.ppGoals.home.p1 });
+    rows.push({ grp: "pp", id: "pp:a", name: `${A} dá gól v přesilovce`, p: x.ppGoals.away.p1 });
+    rows.push({ grp: "pp", id: "pp:an", name: `${A} nedá gól v přesilovce`, p: 1 - x.ppGoals.away.p1 });
+    ou("pp", "Góly v přesilovce celkem", x.ppGoals.total.lines);
+    rows.push({ grp: "first", id: "fg:h", name: `První gól dá ${d.homeName}`, p: x.firstGoal.home });
+    rows.push({ grp: "first", id: "fg:a", name: `První gól dá ${d.awayName}`, p: x.firstGoal.away });
+    d.players.filter((p) => p.active).sort((a, b) => b.pFirstGoal - a.pFirstGoal).slice(0, 12)
+      .forEach((p) => rows.push({ grp: "first", id: "fgp:" + p.id, name: `První gól zápasu – ${p.name} (${p.team})`, p: p.pFirstGoal }));
+  }
   return rows;
 }
 function renderMarkets() {
@@ -1960,6 +2584,8 @@ const PL_COLS = [
   { k: "expShots", t: "Oček. střely", f: (v) => `<b>${num(v, 1)}</b>` },
   { k: "p2Shots", t: "Střely 1.5+", f: pc },
   { k: "p3Shots", t: "Střely 2.5+", f: pc },
+  { k: "p2Points", t: "2+ body", f: pc },
+  { k: "pFirstGoal", t: "První gól", f: (v) => (v ? (v * 100).toFixed(1) + " %" : "–") },
   { k: "last5", t: "Body posl. 5", v: (p) => p.form5, f: (v, p) => `<span class="dots">${p.last5.slice().reverse().map((x) => `<i class="${x > 0 ? "y" : ""}" title="${x} b."></i>`).join("")}</span> ${v}` },
   { k: "homePpg", t: "Doma B/Z", f: (v) => num(v) },
   { k: "awayPpg", t: "Venku B/Z", f: (v) => num(v) },
@@ -1974,6 +2600,7 @@ const CALC_MK = {
   point: ["Kanadský bod (1+)", (p) => p.pPoint], goal: ["Gól", (p) => p.pGoal],
   s15: ["Střely na branku přes 1.5", (p) => p.p2Shots], s25: ["Střely na branku přes 2.5", (p) => p.p3Shots],
   s35: ["Střely na branku přes 3.5", (p) => p.p4Shots],
+  p2: ["Aspoň 2 kanadské body", (p) => p.p2Points], fg: ["Vstřelí první gól zápasu", (p) => p.pFirstGoal],
 };
 function renderCalc() {
   const pid = +$("cpl").value, mk = $("cmk").value, odd = parseFloat($("codd").value);
@@ -2095,7 +2722,7 @@ function renderGame() {
         červený = šance, že padne <b>míň</b>. Pod tím je férový kurz. Graf ukazuje, jak pravděpodobné je každé číslo – žlutá čára je tvoje hranice.</p>
       <div class="seg" id="slkind" style="margin-bottom:14px">
         <button data-v="shots.total" class="on">Střely celkem</button><button data-v="shots.home">Střely ${H}</button><button data-v="shots.away">Střely ${A}</button>
-        <button data-v="goals.total">Góly celkem</button><button data-v="pens.total">Vyloučení celkem</button><button data-v="pens.home">Vyloučení ${H}</button><button data-v="pens.away">Vyloučení ${A}</button></div>
+        <button data-v="goals.total">Góly celkem</button><button data-v="hits.total">Hity celkem</button><button data-v="blocks.total">Bloky celkem</button><button data-v="pens.total">Vyloučení celkem</button><button data-v="pens.home">Vyloučení ${H}</button><button data-v="pens.away">Vyloučení ${A}</button></div>
       <div class="srow"><input type="range" id="slrange"><div class="lineval" id="slval"></div></div>
       <div class="split">
         <div class="side over"><div class="fill" id="slfo"></div><small>Přes (víc než hranice)</small><b id="slpo"></b><span id="slfa"></span></div>
@@ -2110,10 +2737,13 @@ function renderGame() {
       <div class="help" style="margin:0 0 14px"><b>Jak na to:</b> 1) Nahoře vyber typ sázky (výsledek, góly, střely, vyloučení). 2) Na Tipsportu najdi stejnou sázku.
         3) Její kurz napiš do políčka <b>„Kurz sázkovky“</b>. 4) Vpravo uvidíš <b>hodnotu</b>: <span class="ev good">zelená +</span> = kurz je lepší, než by podle modelu měl být (vyplatí se),
         <span class="ev bad">červená −</span> = nevyplatí se.<br><b>Příklad:</b> model dává 60 % → férový kurz 1.67. Když Tipsport nabízí 1.90, je to +14 % hodnota. Když nabízí 1.50, je to −10 %.
-        <br>U vítěze zápasu se kurzy z Tipsportu vyplní samy.</div>
+        <br>U vítěze zápasu se kurzy z Tipsportu vyplní samy. <b>Hity</b> = tvrdé bodyčeky, <b>Bloky</b> = střely zastavené tělem bránícího hráče,
+        <b>Přesilovky</b> = góly, když má tým víc hráčů na ledě (soupeř je vyloučený), <b>První gól</b> = kdo skóruje jako první v zápase.</div>
       <div class="seg" id="mkseg" style="margin-bottom:12px">
         <button data-v="win" class="${GS.mkt === "win" ? "on" : ""}">Výsledek</button><button data-v="goals" class="${GS.mkt === "goals" ? "on" : ""}">Góly</button>
-        <button data-v="shots" class="${GS.mkt === "shots" ? "on" : ""}">Střely</button><button data-v="pens" class="${GS.mkt === "pens" ? "on" : ""}">Vyloučení</button></div>
+        <button data-v="shots" class="${GS.mkt === "shots" ? "on" : ""}">Střely</button><button data-v="pens" class="${GS.mkt === "pens" ? "on" : ""}">Vyloučení</button>
+        <button data-v="hits" class="${GS.mkt === "hits" ? "on" : ""}">Hity</button><button data-v="blocks" class="${GS.mkt === "blocks" ? "on" : ""}">Bloky</button>
+        <button data-v="pp" class="${GS.mkt === "pp" ? "on" : ""}">Přesilovky</button><button data-v="first" class="${GS.mkt === "first" ? "on" : ""}">První gól</button></div>
       <div class="tablewrap" style="background:none"><table class="t" id="mkttable"></table></div>
       <div class="legendtxt">Férový kurz = 1 / šance podle modelu. Hodnota (EV) = šance × kurz − 1: kladné číslo znamená, že sázkovka dává vyšší kurz,
         než by podle modelu odpovídalo. Kurzy, které zadáš, si stránka pamatuje v tvém prohlížeči.</div>
@@ -2145,7 +2775,7 @@ function renderGame() {
     </div>
     <p class="help" style="margin:-4px 0 10px"><b>Co znamenají sloupce:</b> <b>Šance na bod</b> = gól nebo asistence ·
       <b>Fér. kurz</b> = jaký kurz by odpovídal té šanci · <b>Šance na gól</b> = sám dá gól · <b>Oček. střely</b> = kolik střel na branku čekáme ·
-      <b>Střely 1.5+ / 2.5+</b> = šance na aspoň 2 / aspoň 3 střely · <b>Body posl. 5</b> = žluté čtverečky = zápasy, kdy bodoval (nejnovější vpravo), číslo = body celkem ·
+      <b>Střely 1.5+ / 2.5+</b> = šance na aspoň 2 / aspoň 3 střely · <b>2+ body</b> = šance na aspoň 2 kanadské body · <b>První gól</b> = šance, že vstřelí první gól celého zápasu · <b>Body posl. 5</b> = žluté čtverečky = zápasy, kdy bodoval (nejnovější vpravo), číslo = body celkem ·
       <b>Doma / Venku B/Z</b> = průměr bodů na zápas doma a venku · <b>Z, G, A, B</b> = zápasy, góly, asistence, body za sezónu · <b>TOI</b> = čas na ledě v posledních 3 zápasech.
       Šedí hráči v posledních zápasech nehráli (zranění, mimo sestavu).</p>
     <div class="tablewrap"><table class="t" id="pltable"></table></div>
@@ -2449,6 +3079,336 @@ function renderSlip() {
 $("slipbtn").onclick = () => { $("slip").classList.remove("hidden"); $("slipbtn").classList.add("hidden"); renderSlip(); };
 $("slipclose").onclick = () => { $("slip").classList.add("hidden"); $("slipbtn").classList.remove("hidden"); };
 renderSlip();
+
+// ===================================================================
+//  LIVE – 3D hřiště
+// ===================================================================
+const LV = { id: null, data: null, timer: null, shown: 0, replay: null, filt: { shots: true, goals: true, missed: false, blocked: false, hits: false, pens: true, faceoff: false }, per: "all", d3: true };
+const EVCZ = { "faceoff": "Vhazování", "shot-on-goal": "Střela na branku", "goal": "GÓL", "missed-shot": "Střela mimo", "blocked-shot": "Zblokovaná střela",
+  "hit": "Hit (bodyček)", "penalty": "Vyloučení", "takeaway": "Získaný puk", "giveaway": "Ztracený puk" };
+const EVICO = { "faceoff": "⚪", "shot-on-goal": "🎯", "goal": "🚨", "missed-shot": "↗️", "blocked-shot": "🛡️", "hit": "💥", "penalty": "⛔", "takeaway": "🫳", "giveaway": "❌" };
+const PENCZ = { tripping: "podražení", hooking: "hákování", slashing: "sekání", "high-sticking": "vysoká hokejka", "high-sticking-double-minor": "vysoká hokejka (2+2)",
+  interference: "bránění ve hře", roughing: "hrubost", holding: "držení", "holding-the-stick": "držení hokejky", "cross-checking": "krosček", fighting: "bitka",
+  "delay-of-game": "zdržování hry", "delay-of-game-puck-over-glass": "puk mimo hřiště", "too-many-men-on-the-ice": "příliš mnoho hráčů na ledě",
+  "unsportsmanlike-conduct": "nesportovní chování", boarding: "napadení na hrazení", elbowing: "loktem", "embellishment": "simulování", charging: "napadení",
+  "goalie-interference": "bránění brankáři", misconduct: "osobní trest", "game-misconduct": "osobní trest do konce utkání", "instigator": "vyprovokování bitky", kneeing: "kolenem" };
+const PERCZ = (n, t) => (t === "OT" ? "Prodloužení" : t === "SO" ? "Nájezdy" : `${n}. třetina`);
+function stopLive() { clearInterval(LV.timer); LV.timer = null; if (LV.replay) { cancelAnimationFrame(LV.replay.raf); clearTimeout(LV.replay.t); LV.replay = null; } }
+async function openLive(id) {
+  const el = $("view-live");
+  stopLive();
+  el.innerHTML = `<div class="sechead" style="margin-top:30px"><span class="no"><span class="livedot"></span></span><h2>Live hřiště</h2><span class="hint">zápasy dnes a včera</span></div>
+    <p class="help" style="margin-top:-6px">Vyber zápas. <b>Červená tečka = právě se hraje</b> (stránka se sama obnovuje každých 8 vteřin). U odehraných zápasů si můžeš pustit <b>záznam</b> – puk projede celý zápas akci po akci.
+      U zápasů, které ještě nezačaly, uvidíš odpočet.</p>
+    <div class="lgames" id="lgames"><div class="loader" style="padding:20px">Načítám zápasy…</div></div><div id="lmain"></div>`;
+  let list;
+  try { list = (await getJSON("/model/livegames")).games; } catch (e) { $("lgames").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  const stLabel = (g) => (["LIVE", "CRIT"].includes(g.state) ? `<span class="livedot"></span> ${g.period ? PERCZ(g.period, g.periodType) : "ŽIVĚ"} · ${g.clock?.inIntermission ? "přestávka" : g.clock?.timeRemaining || ""}`
+    : ["FINAL", "OFF"].includes(g.state) ? `konec${g.periodType && g.periodType !== "REG" ? " (" + g.periodType + ")" : ""} · záznam` : `🕒 ${fmtDay(g.start)} ${fmtTime(g.start)}`);
+  $("lgames").innerHTML = list.length ? list.map((g) => `<div class="lg ${g.id === id ? "on" : ""}" data-id="${g.id}">
+    <div class="r"><img src="${esc(g.homeLogo)}" alt=""><span>${esc(g.home)}</span><b>${g.score[0] ?? ""}</b></div>
+    <div class="r"><img src="${esc(g.awayLogo)}" alt=""><span>${esc(g.away)}</span><b>${g.score[1] ?? ""}</b></div><small>${stLabel(g)}</small></div>`).join("")
+    : `<p class="help">Dnes ani včera nejsou žádné zápasy.</p>`;
+  $("lgames").querySelectorAll(".lg").forEach((c) => (c.onclick = () => (location.hash = "live-" + c.dataset.id)));
+  if (!id) {
+    const first = list.find((g) => ["LIVE", "CRIT"].includes(g.state)) || list.find((g) => ["FINAL", "OFF"].includes(g.state)) || list[0];
+    if (first) { history.replaceState(null, "", "#live-" + first.id); id = first.id; $("lgames").querySelector(`[data-id="${id}"]`)?.classList.add("on"); }
+    else return;
+  }
+  LV.id = id; LV.data = null; LV.shown = 0;
+  $("lmain").innerHTML = `<div class="loader"><div class="spinner"></div>Načítám zápas…</div>`;
+  await liveFetch(true);
+  if (LV.data && ["LIVE", "CRIT", "PRE"].includes(LV.data.state)) LV.timer = setInterval(() => liveFetch(false), 8000);
+}
+async function liveFetch(first) {
+  const id = LV.id;
+  let d;
+  try { d = await getJSON("/model/live?id=" + id); } catch (e) { if (first) $("lmain").innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (LV.id !== id) return;
+  const prevGoals = LV.data ? (LV.data.home.score ?? 0) + (LV.data.away.score ?? 0) : null;
+  LV.data = d;
+  if (first) renderLive();
+  else { updateLive(prevGoals); }
+}
+function sitInfo(code, d) {
+  if (!code || code.length !== 4) return "";
+  const ag = +code[0], as = +code[1], hs = +code[2], hg = +code[3];
+  let t = "";
+  if (hs > as) t = `<span class="badge pp">⚡ Přesilovka ${d.home.abbr} ${hs} na ${as}</span>`;
+  else if (as > hs) t = `<span class="badge pp">⚡ Přesilovka ${d.away.abbr} ${as} na ${hs}</span>`;
+  if (!hg && ["LIVE", "CRIT"].includes(d.state)) t += ` <span class="badge en">🥅 ${d.home.abbr} bez brankáře</span>`;
+  if (!ag && ["LIVE", "CRIT"].includes(d.state)) t += ` <span class="badge en">🥅 ${d.away.abbr} bez brankáře</span>`;
+  return t;
+}
+function elapsedMin(d) {
+  if (["FINAL", "OFF"].includes(d.state)) return 60;
+  if (!d.period) return 0;
+  const rem = d.clock?.secondsRemaining ?? 1200;
+  return Math.min(65, (Math.min(d.period, 3) - 1) * 20 + (d.period > 3 ? 20 + (300 - rem) / 60 : (1200 - rem) / 60));
+}
+function rinkSvg(d) {
+  const S = 5, W = 200 * S, H = 85 * S, X = (x) => (x + 100) * S, Y = (y) => (42.5 - y) * S;
+  const homeSide = d.homeSide || "left";
+  const lbl = (side, ab) => `<text x="${side === "left" ? X(-80) : X(80)}" y="${Y(-37)}" font-size="22" font-weight="800" fill="#334155" text-anchor="middle">${ab}</text>`;
+  return `<svg viewBox="-10 -10 ${W + 20} ${H + 20}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">
+    <defs><radialGradient id="ice2" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#f4f9ff"/><stop offset="1" stop-color="#cddcec"/></radialGradient>
+      <clipPath id="rclip"><rect x="0" y="0" width="${W}" height="${H}" rx="${28 * S}"/></clipPath>
+      <radialGradient id="puckg" cx="40%" cy="35%" r="70%"><stop offset="0" stop-color="#4b5563"/><stop offset="1" stop-color="#030712"/></radialGradient></defs>
+    <rect x="-8" y="-8" width="${W + 16}" height="${H + 16}" rx="${30 * S}" fill="#0f172a" stroke="#64748b" stroke-width="6"/>
+    <g clip-path="url(#rclip)"><rect x="0" y="0" width="${W}" height="${H}" fill="url(#ice2)"/>
+      <image href="${esc(d.home.logo)}" x="${X(0) - 70}" y="${Y(0) - 70}" width="140" height="140" opacity=".12"/>
+      <line x1="${X(0)}" x2="${X(0)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="${S * 1.2}"/>
+      <line x1="${X(-25)}" x2="${X(-25)}" y1="0" y2="${H}" stroke="#2563eb" stroke-width="${S * 1.2}"/><line x1="${X(25)}" x2="${X(25)}" y1="0" y2="${H}" stroke="#2563eb" stroke-width="${S * 1.2}"/>
+      <line x1="${X(-89)}" x2="${X(-89)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="3"/><line x1="${X(89)}" x2="${X(89)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="3"/>
+      <circle cx="${X(0)}" cy="${Y(0)}" r="${15 * S}" fill="none" stroke="#2563eb" stroke-width="3"/><circle cx="${X(0)}" cy="${Y(0)}" r="${S}" fill="#2563eb"/>
+      ${[-69, 69].map((fx) => [22, -22].map((fy) => `<circle cx="${X(fx)}" cy="${Y(fy)}" r="${15 * S}" fill="none" stroke="#e11d48" stroke-width="3"/><circle cx="${X(fx)}" cy="${Y(fy)}" r="${S}" fill="#e11d48"/>`).join("")).join("")}
+      ${[-20, 20].map((fx) => [22, -22].map((fy) => `<circle cx="${X(fx)}" cy="${Y(fy)}" r="${S}" fill="#e11d48"/>`).join("")).join("")}
+      <path d="M${X(-89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 1 ${X(-89)} ${Y(-4)}" fill="#93c5fd" opacity=".8" stroke="#e11d48" stroke-width="3"/>
+      <path d="M${X(89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 0 ${X(89)} ${Y(-4)}" fill="#93c5fd" opacity=".8" stroke="#e11d48" stroke-width="3"/>
+      <rect x="${X(-92.3)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
+      <rect x="${X(89)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
+      ${lbl(homeSide, "branka " + d.home.abbr)}${lbl(homeSide === "left" ? "right" : "left", "branka " + d.away.abbr)}
+      <g id="evlayer"></g>
+      <g id="puck" style="transform:translate(${X(0)}px,${Y(0)}px)"><ellipse cx="0" cy="4" rx="13" ry="6" fill="rgba(0,0,0,.25)"/><circle r="10" fill="url(#puckg)" stroke="#000" stroke-width="2"/></g>
+    </g></svg>`;
+}
+function evVisible(e) {
+  const f = LV.filt;
+  if (LV.per !== "all" && String(e.per) !== LV.per) return false;
+  return (e.type === "shot-on-goal" && f.shots) || (e.type === "goal" && f.goals) || (e.type === "missed-shot" && f.missed) ||
+    (e.type === "blocked-shot" && f.blocked) || (e.type === "hit" && f.hits) || (e.type === "penalty" && f.pens) || (e.type === "faceoff" && f.faceoff);
+}
+function evMark(e, d, ripple) {
+  if (e.x == null || e.y == null) return "";
+  const S = 5, x = (e.x + 100) * S, y = (42.5 - e.y) * S, c = e.team === d.home.abbr ? "#0ea5e9" : "#8b5cf6";
+  const tip = `<title>${PERCZ(e.per)} ${e.time} · ${EVCZ[e.type]} · ${e.who ? e.who.name : ""} (${e.team || ""})</title>`;
+  let m = "";
+  if (e.type === "goal") m = `<g class="ev goal"><circle cx="${x}" cy="${y}" r="14" fill="#fbbf24" stroke="#78350f" stroke-width="3"/><text x="${x}" y="${y + 5}" font-size="15" font-weight="900" text-anchor="middle" fill="#78350f">G</text>${tip}</g>`;
+  else if (e.type === "shot-on-goal") m = `<circle class="ev" cx="${x}" cy="${y}" r="7" fill="${c}" stroke="#fff" stroke-width="2">${tip}</circle>`;
+  else if (e.type === "missed-shot") m = `<circle class="ev" cx="${x}" cy="${y}" r="6" fill="none" stroke="${c}" stroke-width="3">${tip}</circle>`;
+  else if (e.type === "blocked-shot") m = `<g class="ev"><path d="M${x - 6} ${y - 6} L${x + 6} ${y + 6} M${x + 6} ${y - 6} L${x - 6} ${y + 6}" stroke="${c}" stroke-width="3.5"/>${tip}</g>`;
+  else if (e.type === "hit") m = `<rect class="ev" x="${x - 6}" y="${y - 6}" width="12" height="12" transform="rotate(45 ${x} ${y})" fill="#64748b" opacity=".8">${tip}</rect>`;
+  else if (e.type === "penalty") m = `<g class="ev"><rect x="${x - 10}" y="${y - 10}" width="20" height="20" rx="4" fill="#ef4444"/><text x="${x}" y="${y + 6}" font-size="16" font-weight="900" text-anchor="middle" fill="#fff">!</text>${tip}</g>`;
+  else if (e.type === "faceoff") m = `<circle class="ev" cx="${x}" cy="${y}" r="4" fill="#94a3b8">${tip}</circle>`;
+  if (ripple) m += `<circle class="ripple" cx="${x}" cy="${y}" r="12" fill="none" stroke="${e.type === "goal" ? "#fbbf24" : c}" stroke-width="3"/>`;
+  return m;
+}
+function movePuck(e) {
+  if (!e || e.x == null) return;
+  const p = document.getElementById("puck");
+  if (p) p.style.transform = `translate(${(e.x + 100) * 5}px,${(42.5 - e.y) * 5}px)`;
+}
+function evText(e) {
+  const w = e.who ? `<b>${esc(e.who.name)}</b>${e.who.num != null ? " #" + e.who.num : ""}` : "";
+  let t = `${EVCZ[e.type]} ${e.team ? `<span class="muted">${e.team}</span>` : ""} ${w}`;
+  if (e.type === "goal") t = `<b style="color:var(--gold)">🚨 GÓL ${e.team}!</b> ${w}${e.extra?.length ? `<small>asistence: ${e.extra.map((a) => esc(a.name)).join(", ")}</small>` : "<small>bez asistence</small>"}${e.score ? `<small>stav ${e.score[0]}:${e.score[1]}</small>` : ""}`;
+  if (e.type === "penalty") t += `<small>${PENCZ[e.desc] || esc(e.desc || "")} · ${e.dur || 2} min</small>`;
+  if (e.type === "hit" && e.extra?.length) t += `<small>do hráče ${esc(e.extra[0].name)}</small>`;
+  return t;
+}
+function liveCounts(d, evs) {
+  const c = { [d.home.abbr]: { g: 0, sog: 0, pen: 0, hits: 0 }, [d.away.abbr]: { g: 0, sog: 0, pen: 0, hits: 0 } };
+  evs.forEach((e) => { const t = c[e.team]; if (!t) return;
+    if (e.type === "goal") { t.g++; t.sog++; } else if (e.type === "shot-on-goal") t.sog++; else if (e.type === "penalty") t.pen++; else if (e.type === "hit") t.hits++; });
+  return c;
+}
+function renderLive() {
+  const d = LV.data, H = d.home.abbr, A = d.away.abbr;
+  const fut = ["FUT", "PRE"].includes(d.state), fin = ["FINAL", "OFF"].includes(d.state);
+  $("lmain").innerHTML = `
+    <div class="lscore" style="--hc:${tcol(H)};--ac:${tcol(A)}">
+      <div class="t"><img src="${esc(d.home.logo)}" alt=""><div><b>${esc(d.home.name)}</b><small>doma · střely <span id="lsogh">${d.home.sog ?? 0}</span></small></div></div>
+      <div class="mid"><div class="clk" id="lclk"></div><div class="sc" id="lsc">${d.home.score ?? 0} : ${d.away.score ?? 0}</div><div id="lsit"></div></div>
+      <div class="t r"><img src="${esc(d.away.logo)}" alt=""><div><b>${esc(d.away.name)}</b><small>venku · střely <span id="lsoga">${d.away.sog ?? 0}</span></small></div></div>
+    </div>
+    ${fut ? `<div class="card" style="margin-top:14px;text-align:center"><h3 class="display" style="font-size:40px;margin:6px 0">Zápas ještě nezačal</h3>
+      <div class="countdown" data-start="${d.start}" style="font-size:20px"></div><p class="help">Jakmile začne, uvidíš tady živě puk, střely a vyloučení. Mezitím se podívej na <a href="#zapas-${d.id}">předpověď zápasu</a>.</p></div>` : ""}
+    <div class="lfilters">
+      <button class="btn" id="l3d">${LV.d3 ? "🔲 Přepnout na 2D" : "🧊 Přepnout na 3D"}</button>
+      ${fin ? `<button class="btn primary" id="lreplay">▶ Přehrát záznam zápasu</button><select id="lspeed"><option value="1">rychlost 1×</option><option value="4" selected>rychlost 4×</option><option value="15">rychlost 15×</option></select>` : ""}
+      <select id="lper"><option value="all">všechny třetiny</option><option value="1">1. třetina</option><option value="2">2. třetina</option><option value="3">3. třetina</option><option value="4">prodloužení</option></select>
+      ${[["shots", "🎯 střely"], ["goals", "🚨 góly"], ["missed", "↗️ mimo"], ["blocked", "🛡️ zblokované"], ["hits", "💥 hity"], ["pens", "⛔ vyloučení"], ["faceoff", "⚪ vhazování"]]
+        .map(([k, l]) => `<label><input type="checkbox" data-f="${k}" ${LV.filt[k] ? "checked" : ""}> ${l}</label>`).join("")}
+    </div>
+    <p class="help">Hřiště ukazuje akce zápasu přesně tam, kde se staly. <b>Černý puk</b> se přesouvá na místo poslední akce. Barevná tečka = střela na branku (barva týmu), <b>zlaté G</b> = gól,
+      prázdný kroužek = střela mimo, křížek = zblokovaná střela, šedý kosočtverec = hit, <b>červené !</b> = vyloučení. Najeď na značku myší a uvidíš, kdo to byl.
+      <b style="color:#0ea5e9">Modrá = ${H} (domácí)</b>, <b style="color:#8b5cf6">fialová = ${A} (hosté)</b>. U spodního okraje je napsané, čí je která branka (v každé třetině se strany mění). Zaškrtávátky výše si vybereš, co chceš vidět.</p>
+    <div class="lgrid">
+      <div><div class="rinkstage ${LV.d3 ? "d3" : ""}" id="rstage"><div class="tilt3d">${rinkSvg(d)}</div></div>
+        <div class="sechead" style="margin-top:20px"><h2 style="font-size:34px">Tempo zápasu</h2><span class="hint">skutečnost vs. předpověď</span></div><div class="pace" id="lpace"></div>
+        <p class="help"><b>Tempo</b> = kolik by toho padlo za celý zápas, kdyby se hrálo stejně jako doteď. Porovnej s tím, co čekal model před zápasem.</p>
+        <div class="sechead" style="margin-top:20px"><h2 style="font-size:34px">Po třetinách</h2></div><div class="tablewrap"><table class="t" id="lper-t"></table></div>
+        <p class="help">G = góly, Střely = na branku, Mimo = střely vedle, Zblok. = střely, které soupeř zblokoval, Hity = bodyčeky, Vyl. = počet vyloučení (v závorce trestné minuty).</p>
+      </div>
+      <div class="card"><b>📰 Průběh zápasu</b><p class="help" style="margin:4px 0 8px">Nejnovější akce nahoře.</p><div class="feed" id="lfeed"></div></div>
+    </div>
+    <div class="sechead"><h2 style="font-size:40px">Hráči</h2><span class="hint">seřazeno podle střel na branku</span></div>
+    <p class="help" style="margin-top:-6px"><b>Střely</b> = střely na branku v tomto zápase, za lomítkem kolik jich čekal model (✅ = už splnil). <b>TM</b> = trestné minuty, <b>+/-</b> = plus/minus, <b>TOI</b> = čas na ledě.</p>
+    <div class="grid g2" id="lplayers"></div>`;
+  $("l3d").onclick = () => { LV.d3 = !LV.d3; $("rstage").classList.toggle("d3", LV.d3); $("l3d").textContent = LV.d3 ? "🔲 Přepnout na 2D" : "🧊 Přepnout na 3D"; };
+  $("lper").onchange = (e) => { LV.per = e.target.value; drawEvents(LV.replay ? LV.replay.i : d.events.length, false); };
+  document.querySelectorAll("#lmain [data-f]").forEach((c) => (c.onchange = () => { LV.filt[c.dataset.f] = c.checked; drawEvents(LV.replay ? LV.replay.i : d.events.length, false); }));
+  if (fin) $("lreplay").onclick = startReplay;
+  LV.shown = d.events.length;
+  drawEvents(d.events.length, false);
+  movePuck([...d.events].reverse().find((e) => e.x != null));
+  updatePanels(d.events.length);
+  countdowns();
+}
+function drawEvents(upto, animateLast) {
+  const d = LV.data, layer = document.getElementById("evlayer");
+  if (!layer) return;
+  const evs = d.events.slice(0, upto).filter(evVisible);
+  layer.innerHTML = evs.map((e, i) => evMark(e, d, animateLast && i === evs.length - 1)).join("");
+}
+function updatePanels(upto) {
+  const d = LV.data, H = d.home.abbr, A = d.away.abbr, evs = d.events.slice(0, upto);
+  const replay = !!LV.replay;
+  const c = liveCounts(d, evs);
+  const last = evs[evs.length - 1];
+  $("lsc").textContent = replay ? `${c[H].g} : ${c[A].g}` : `${d.home.score ?? 0} : ${d.away.score ?? 0}`;
+  $("lsogh").textContent = replay ? c[H].sog : d.home.sog ?? c[H].sog;
+  $("lsoga").textContent = replay ? c[A].sog : d.away.sog ?? c[A].sog;
+  const fin = ["FINAL", "OFF"].includes(d.state);
+  $("lclk").innerHTML = replay ? `▶ záznam · ${last ? PERCZ(last.per) + " · " + last.time : ""}`
+    : fin ? `Konec zápasu${d.end && d.end !== "REG" ? " (" + d.end + ")" : ""}` : d.period ? `<span class="livedot"></span> ${PERCZ(d.period, d.periodType)} · ${d.clock?.inIntermission ? "přestávka" : (d.clock?.timeRemaining || "") + " do konce"}` : "";
+  $("lsit").innerHTML = replay ? sitInfo(last?.sit, { ...d, state: "LIVE" }) : sitInfo(d.situation, d);
+  $("lfeed").innerHTML = evs.filter((e) => e.type !== "faceoff").slice(-40).reverse().map((e) =>
+    `<div class="fe ${e.type === "goal" ? "goal" : ""}"><span class="tm">${e.per}. ${e.time}</span><span>${EVICO[e.type]}</span><span>${evText(e)}</span></div>`).join("") || `<p class="help">Zatím žádné akce.</p>`;
+  // třetiny
+  const per = {};
+  evs.forEach((e) => { if (!e.team) return; const s = ((per[e.per] = per[e.per] || {})[e.team] = per[e.per][e.team] || { g: 0, sog: 0, miss: 0, blk: 0, hits: 0, pen: 0, pim: 0 });
+    if (e.type === "goal") { s.g++; s.sog++; } else if (e.type === "shot-on-goal") s.sog++; else if (e.type === "missed-shot") s.miss++; else if (e.type === "blocked-shot") s.blk++;
+    else if (e.type === "hit") s.hits++; else if (e.type === "penalty") { s.pen++; s.pim += e.dur || 2; } });
+  const pers = Object.keys(per).map(Number).sort();
+  const z = { g: 0, sog: 0, miss: 0, blk: 0, hits: 0, pen: 0, pim: 0 };
+  const cell = (s) => `<td><b>${s.g}</b></td><td>${s.sog}</td><td>${s.miss}</td><td>${s.blk}</td><td>${s.hits}</td><td>${s.pen} (${s.pim})</td>`;
+  const tot = (t) => pers.reduce((a, p) => { const s = per[p][t] || z; Object.keys(a).forEach((k) => (a[k] += s[k])); return a; }, { ...z });
+  $("lper-t").innerHTML = `<thead><tr><th class="left">Třetina</th><th class="left">Tým</th><th>G</th><th>Střely</th><th>Mimo</th><th>Zblok.</th><th>Hity</th><th>Vyl. (TM)</th></tr></thead><tbody>` +
+    pers.map((p) => [H, A].map((t, i) => `<tr><td class="left">${i ? "" : PERCZ(p, p > 3 ? "OT" : "REG")}</td><td class="left" style="color:${i ? "var(--away)" : "var(--home)"};font-weight:800">${t}</td>${cell(per[p][t] || z)}</tr>`).join("")).join("") +
+    [H, A].map((t, i) => `<tr style="background:rgba(255,255,255,.04)"><td class="left">${i ? "" : "<b>Celkem</b>"}</td><td class="left" style="font-weight:800">${t}</td>${cell(tot(t))}</tr>`).join("") + "</tbody>";
+  // tempo
+  const pre = d.pre, em = replay ? (last ? Math.min(60, (last.per - 1) * 20 + (+last.time.split(":")[0]) + (+last.time.split(":")[1]) / 60) : 0) : elapsedMin(d);
+  const pace = (v) => (em > 2 ? (v * 60) / em : null);
+  const shotsNow = c[H].sog + c[A].sog, pensNow = c[H].pen + c[A].pen, goalsNow = c[H].g + c[A].g;
+  const box = (lab, now, exp) => `<div><small>${lab}</small><b>${now}</b><small>${pace(now) != null && em < 60 ? `tempo na <b style="font-size:15px;display:inline;font-family:Inter">${pace(now).toFixed(0)}</b> za zápas · ` : ""}${exp != null ? `model čekal ${exp.toFixed(1)}` : ""}</small></div>`;
+  $("lpace").innerHTML = box("Střely na branku celkem", shotsNow, pre?.shots.total) + box("Vyloučení celkem", pensNow, pre?.pens.total) + box("Góly celkem", goalsNow, pre?.goals.total) +
+    `<div><small>Odehráno</small><b>${Math.round(em)}′</b><small>z 60 minut</small></div>`;
+  // hráči
+  if (!replay) $("lplayers").innerHTML = [H, A].map((t) => {
+    const p = d.players[t] || { skaters: [], goalies: [] };
+    const rows = [...p.skaters].sort((a, b) => b.sog - a.sog || b.pts - a.pts);
+    return `<div class="card"><b style="color:${t === H ? "var(--home)" : "var(--away)"};font-size:18px">${t}</b>
+      <div class="tablewrap" style="margin-top:8px;background:none"><table class="t"><thead><tr><th class="left">#</th><th class="left">Hráč</th><th>G</th><th>A</th><th>Střely</th><th>TM</th><th>Hity</th><th>Bloky</th><th>+/-</th><th>TOI</th></tr></thead><tbody>
+      ${rows.map((r) => { const ex = pre?.players?.[r.id]?.expShots; return `<tr><td class="left pos">${r.num ?? ""}</td><td class="left"><b>${esc(r.name)}</b>${r.pts ? ` <span class="pill hot">${r.pts} b.</span>` : ""}</td>
+        <td>${r.g}</td><td>${r.a}</td><td class="gold">${r.sog}${ex != null ? `<small class="muted">/${ex.toFixed(1)}</small>${r.sog >= ex ? " ✅" : ""}` : ""}</td><td>${r.pim}</td><td>${r.hits}</td><td>${r.blk}</td>
+        <td>${r.pm > 0 ? "+" + r.pm : r.pm}</td><td>${toi(r.toi)}</td></tr>`; }).join("")}</tbody></table></div>
+      ${p.goalies.map((g) => `<p class="help">🧤 <b>${esc(g.name)}</b>: ${g.sv} zákroků z ${g.sa} střel (${g.sa ? ((g.sv / g.sa) * 100).toFixed(1) : "–"} %), ${g.ga} gólů</p>`).join("")}</div>`;
+  }).join("");
+}
+function updateLive(prevGoals) {
+  const d = LV.data;
+  const newEvs = d.events.slice(LV.shown);
+  LV.shown = d.events.length;
+  const goals = (d.home.score ?? 0) + (d.away.score ?? 0);
+  if (prevGoals != null && goals > prevGoals) { const sc = $("lsc"); sc.classList.remove("flash"); void sc.offsetWidth; sc.classList.add("flash"); }
+  let i = 0;
+  const step = () => {
+    if (!$("evlayer")) return;
+    const upto = d.events.length - newEvs.length + i + 1;
+    if (i < newEvs.length) { drawEvents(upto, evVisible(newEvs[i])); movePuck(newEvs[i]); i++; setTimeout(step, 700); }
+  };
+  if (newEvs.length) step(); else drawEvents(d.events.length, false);
+  updatePanels(d.events.length);
+  if (!["LIVE", "CRIT", "PRE"].includes(d.state)) stopLive();
+}
+function startReplay() {
+  const d = LV.data;
+  if (LV.replay) { clearTimeout(LV.replay.t); LV.replay = null; $("lreplay").textContent = "▶ Přehrát záznam zápasu"; drawEvents(d.events.length, false); updatePanels(d.events.length); return; }
+  LV.replay = { i: 0, t: null };
+  $("lreplay").textContent = "⏹ Zastavit záznam";
+  const tick = () => {
+    if (!LV.replay || !$("evlayer")) return;
+    const sp = +($("lspeed")?.value || 4);
+    const r = LV.replay;
+    r.i++;
+    const e = d.events[r.i - 1];
+    drawEvents(r.i, e && evVisible(e));
+    movePuck(e);
+    if (e && e.type === "goal") { const sc = $("lsc"); sc.classList.remove("flash"); void sc.offsetWidth; sc.classList.add("flash"); }
+    updatePanels(r.i);
+    if (r.i >= d.events.length) { LV.replay = null; $("lreplay").textContent = "↻ Přehrát znovu"; updatePanels(d.events.length); return; }
+    const pause = e && e.type === "goal" ? 2200 : 650;
+    r.t = setTimeout(tick, pause / sp);
+  };
+  tick();
+}
+
+// ===================================================================
+//  Přesnost modelu
+// ===================================================================
+async function loadAcc() {
+  const el = $("view-acc");
+  el.innerHTML = `<div class="loader"><div class="spinner"></div>Počítám, jak by model tipoval odehrané zápasy…</div>`;
+  let b;
+  try { b = await getJSON("/model/backtest"); } catch (e) { el.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (b.loading) { renderLoading(el, b); clearTimeout(pollTimer); pollTimer = setTimeout(loadAcc, 3000); return; }
+  const pct = (x) => (x == null ? "–" : Math.round(x * 100) + " %");
+  const cal = b.calib;
+  const W = 560, Hh = 220, bw = W / Math.max(1, cal.length);
+  let svg = `<svg viewBox="0 0 ${W} ${Hh + 40}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">`;
+  for (let i = 0; i <= 4; i++) svg += `<line x1="0" x2="${W}" y1="${Hh - (Hh * i) / 4}" y2="${Hh - (Hh * i) / 4}" stroke="rgba(148,163,184,.12)"/><text x="2" y="${Hh - (Hh * i) / 4 - 3}" font-size="10" fill="#8796ae">${i * 25} %</text>`;
+  cal.forEach((c, i) => {
+    const x = i * bw + bw * 0.18, w = bw * 0.3;
+    svg += `<rect x="${x}" y="${Hh - c.pred * Hh}" width="${w}" height="${c.pred * Hh}" rx="4" fill="#38bdf8"><title>Model čekal ${pct(c.pred)}</title></rect>
+      <rect x="${x + w + 4}" y="${Hh - c.actual * Hh}" width="${w}" height="${c.actual * Hh}" rx="4" fill="#fbbf24"><title>Ve skutečnosti ${pct(c.actual)}</title></rect>
+      <text x="${i * bw + bw / 2}" y="${Hh + 16}" font-size="11" fill="#c7d3e6" text-anchor="middle" font-weight="700">${c.bin * 20}–${c.bin * 20 + 20} %</text>
+      <text x="${i * bw + bw / 2}" y="${Hh + 32}" font-size="10" fill="#8796ae" text-anchor="middle">${c.n} tipů</text>`;
+  });
+  svg += "</svg>";
+  el.innerHTML = `
+    <section class="cine" id="cine" style="padding-bottom:30px">${RINK}<div class="spot"></div>
+      <div class="kicker">zpětný test · ${fmtDate(b.from)} – ${fmtDate(b.to)}</div>
+      <h1 class="display">Jak moc<span>model trefuje</span></h1>
+      <p class="lead">Model jsme nechali „tipovat“ ${b.games} už odehraných zápasů – vždy jen z dat, která byla známá <b>před</b> zápasem. Pak jsme to porovnali se skutečností.</p>
+      <div class="counters">
+        <div><b data-count="${Math.round(b.winner.pct * 100)}">0</b><small>% trefený vítěz</small></div>
+        <div><b data-count="${b.top1.hit}">0</b><small>z ${b.top1.n} top tipů na bod vyšlo</small></div>
+        <div><b>±${b.shotsMae}</b><small>odchylka střel</small></div>
+        <div><b>±${b.pensMae}</b><small>odchylka vyloučení</small></div>
+      </div>
+    </section>
+    <div class="helpbox"><h3>👀 Jak to číst</h3><div class="help" style="margin:0"><ul>
+      <li><b>Trefený vítěz</b>: v kolika zápasech vyhrál tým, kterému model dával víc než 50 %. Hokej je hodně náhodný – i nejlepší modely na světě trefí vítěze jen asi v 58–62 % zápasů.</li>
+      <li><b>Odchylka</b>: o kolik se model v průměru spletl. „±${b.shotsMae} střel“ = skutečný počet střel byl v průměru o ${b.shotsMae} jinde, než model čekal (průměrný zápas má ${b.avgShots} střel).</li>
+      <li><b>Top tipy na bod</b>: v každém zápase hráč s nejvyšší šancí na bod. Model čekal, že jich vyjde zhruba ${b.top1.expected} z ${b.top1.n} – ve skutečnosti vyšlo <b>${b.top1.hit}</b>.</li>
+      <li><b>Graf níže</b> je nejdůležitější: když model říká „60 %“, mělo by to opravdu vyjít asi v 60 % případů. Čím víc se modrý a žlutý sloupec shodují, tím víc se dá procentům věřit.</li>
+    </ul></div></div>
+    <div class="grid g3">
+      <div class="card bigstat"><small>Vítěz zápasu</small><b style="color:var(--cyan)">${pct(b.winner.pct)}</b><p class="help">${b.winner.ok} z ${b.games} zápasů.
+        Když si byl model jistý (60 % a víc): <b>${pct(b.winner.confPct)}</b> z ${b.winner.confN} zápasů.</p></div>
+      <div class="card bigstat"><small>Top 3 tipy na bod v zápase</small><b style="color:var(--gold)">${pct(b.top3.hit / Math.max(1, b.top3.n))}</b><p class="help">${b.top3.hit} z ${b.top3.n} tipů vyšlo (model čekal ${b.top3.expected}).</p></div>
+      <div class="card bigstat"><small>Góly celkem – odchylka</small><b>±${b.goalsMae}</b><p class="help">Góly jsou nejvíc náhodné – i dobrý model se tu splete o 1,5–2 góly.</p></div>
+    </div>
+    <div class="sechead"><span class="no">01</span><h2>Dá se procentům věřit?</h2><span class="hint">šance na kanadský bod – všechny tipy</span></div>
+    <div class="card calib">${svg}<div class="legend"><span><i style="background:#38bdf8"></i>co model čekal</span><span><i style="background:#fbbf24"></i>jak to dopadlo ve skutečnosti</span></div>
+      <p class="help">Hráče jsme rozdělili podle toho, jakou jim model dával šanci na bod (např. 40–60 %). <b>Modrý sloupec</b> = průměrná šance od modelu, <b>žlutý</b> = kolik z nich opravdu bodovalo.
+        Když jsou sloupce stejně vysoké, model je „poctivý“ – jeho procenta odpovídají realitě.</p></div>
+    <div class="sechead"><span class="no">02</span><h2>Zápas po zápasu</h2><span class="hint">nejnovější nahoře</span></div>
+    <p class="help" style="margin-top:-6px">✅ = model tipoval správně, ❌ = netrefil. U střel a vyloučení: <b>čekal / skutečnost</b>. U hráčů: ✅ = bodoval, ❌ = nebodoval.</p>
+    <div class="tablewrap"><table class="t"><thead><tr><th class="left">Datum</th><th class="left">Zápas</th><th>Šance domácích</th><th>Výsledek</th><th>Střely</th><th>Vyloučení</th><th>Góly</th><th class="left">Top 3 tipy na bod</th></tr></thead><tbody>
+      ${b.rows.map((r) => { const ok = (r.winP >= 0.5) === r.homeWon; return `<tr><td class="left">${fmtDate(r.date)}</td><td class="left"><b>${r.home} – ${r.away}</b></td>
+        <td>${pc(r.winP)}</td><td>${r.score}${r.end !== "REG" ? " " + r.end : ""} ${ok ? '<span class="okc">✅</span>' : '<span class="noc">❌</span>'}</td>
+        <td>${r.expShots} / <b>${r.shots}</b></td><td>${r.expPens} / <b>${r.pens ?? "–"}</b></td><td>${r.expGoals} / <b>${r.goals}</b></td>
+        <td class="left">${r.top3.map((t) => `${t.hit ? "✅" : "❌"} ${esc(splitName(t.name)[1])} <small class="muted">${pc(t.p)}</small>`).join(" · ")}</td></tr>`; }).join("")}
+    </tbody></table></div>
+    <div class="disc">Zpětný test používá stejný model jako předpovědi, ale pro každý zápas jen data z dřívějších zápasů. Soupisky jsou aktuální, takže hráči, kteří mezitím přestoupili, chybí.
+      Výsledky za 2 týdny jsou malý vzorek – čísla se mohou dost měnit. Ani dobrý model neznamená jistou výhru.</div>`;
+  interactive(el);
+}
+
+// PWA
+if ("serviceWorker" in navigator) { try { navigator.serviceWorker.register("/sw.js").catch(() => {}); } catch (e) {} }
 
 // ===================================================================
 //  AI chat
