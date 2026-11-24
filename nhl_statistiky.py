@@ -1540,7 +1540,7 @@ def live_game(gid):
                            "ga": p.get("goalsAgainst", 0), "toi": _toi(p.get("toi"))})
         players[ab] = {"skaters": sk, "goalies": gk}
     pd = pbp.get("periodDescriptor") or {}
-    pred = LEAGUE.preds.get(gid)
+    pred = LEAGUE.preds.get(gid) or (LEAGUE.history.get(gid) or (0, None))[1]
     pre = None
     if pred:
         pre = {"shots": {k: pred["shots"][k]["exp"] for k in ("home", "away", "total")},
@@ -1548,7 +1548,7 @@ def live_game(gid):
                "goals": {k: pred["goals"][k] for k in ("home", "away", "total")},
                "win": pred["win"],
                "players": {pl["id"]: {"pPoint": pl["pPoint"], "expShots": pl["expShots"]} for pl in pred["players"]}}
-    return {
+    res = {
         "id": gid, "state": pbp.get("gameState"), "start": pbp.get("startTimeUTC"), "venue": _abbr(pbp.get("venue")),
         "period": pd.get("number"), "periodType": pd.get("periodType"), "clock": pbp.get("clock"),
         "home": {"abbr": ht.get("abbrev"), "name": f"{_abbr(ht.get('placeName')) or ''} {_abbr(ht.get('commonName')) or ''}".strip(),
@@ -1558,6 +1558,142 @@ def live_game(gid):
         "situation": last_sit, "homeSide": last_side, "events": events, "periods": periods, "players": players, "pre": pre,
         "end": (pbp.get("gameOutcome") or {}).get("lastPeriodType"),
     }
+    try:
+        res["liveModel"] = live_model(res, pred)
+    except Exception as e:
+        print("live model:", e, flush=True)
+    ts = TS_ODDS.get(gid)
+    if ts:
+        res["tipsport"] = ts
+    return res
+
+
+# ---------------------------------------------------------------------------
+#  LIVE sázkový model – šance přepočítané podle aktuálního stavu zápasu
+# ---------------------------------------------------------------------------
+def _pois_vec(lam, n=12):
+    return [_pmf(k, lam) for k in range(n)]
+
+
+def live_model(d, pred):
+    """Z aktuálního skóre, času a střel spočítá šance pro zbytek zápasu."""
+    if not pred or d.get("state") not in ("LIVE", "CRIT"):
+        return None
+    per = d.get("period") or 1
+    clk = d.get("clock") or {}
+    rem_s = clk.get("secondsRemaining")
+    if rem_s is None:
+        rem_s = 1200
+    if per > 3:
+        return {"ot": True, "note": "Hraje se prodloužení – rozhodne příští gól."}
+    elapsed = (per - 1) * 20 + (1200 - rem_s) / 60
+    rem = max(0.0, 60 - elapsed)
+    sh, sa = d["home"].get("score") or 0, d["away"].get("score") or 0
+    sogH, sogA = d["home"].get("sog") or 0, d["away"].get("sog") or 0
+    eH, eA = pred["shots"]["home"]["exp"], pred["shots"]["away"]["exp"]
+    gH0, gA0 = pred["goals"]["home"], pred["goals"]["away"]
+    w = elapsed / (elapsed + 25)
+    rateSH = (1 - w) * eH / 60 + w * (sogH / max(1, elapsed))
+    rateSA = (1 - w) * eA / 60 + w * (sogA / max(1, elapsed))
+    shpH, shpA = gH0 / max(1, eH), gA0 / max(1, eA)
+    lamH, lamA = rateSH * shpH * rem, rateSA * shpA * rem
+    # přesilovka právě teď
+    sit = d.get("situation") or "1551"
+    try:
+        ag, as_, hs, hg = int(sit[0]), int(sit[1]), int(sit[2]), int(sit[3])
+    except Exception:
+        ag, as_, hs, hg = 1, 5, 5, 1
+    pp_note = None
+    if hs > as_:
+        lamH += 0.12; pp_note = f"{d['home']['abbr']} hraje přesilovku"
+    elif as_ > hs:
+        lamA += 0.12; pp_note = f"{d['away']['abbr']} hraje přesilovku"
+    # konec zápasu: prohrávající tým odvolá brankáře
+    diff = sh - sa
+    if rem < 3.5 and 1 <= abs(diff) <= 2:
+        k = (3.5 - min(rem, 3.5)) / 3.5 + 0.4
+        if diff > 0:
+            lamH += 0.35 * k; lamA += 0.2 * k
+        else:
+            lamA += 0.35 * k; lamH += 0.2 * k
+    lamH, lamA = max(lamH, 0.001), max(lamA, 0.001)
+    vh, va = _pois_vec(lamH), _pois_vec(lamA)
+    pH = pA = pT = 0.0
+    tot = {}
+    for i, a in enumerate(vh):
+        for j, b in enumerate(va):
+            p = a * b
+            fh, fa = sh + i, sa + j
+            if fh > fa:
+                pH += p
+            elif fa > fh:
+                pA += p
+            else:
+                pT += p
+            tot[fh + fa] = tot.get(fh + fa, 0) + p
+    ot_home = _clamp(0.5 + (pred["win"]["home"] - 0.5) * 0.5, 0.35, 0.65)
+    cur_total = sh + sa
+    lines = []
+    for L in [cur_total + 0.5 + k for k in range(0, 5)]:
+        over = sum(p for t, p in tot.items() if t > L)
+        lines.append({"line": L, "over": round(over, 4), "under": round(1 - over, 4)})
+    p_none = math.exp(-(lamH + lamA))
+    nextH = (1 - p_none) * lamH / (lamH + lamA)
+    nextA = (1 - p_none) * lamA / (lamH + lamA)
+    # hráči: šance, že (ještě) dají gól do konce základní doby
+    pls = []
+    box = {p["id"]: p for t in (d.get("players") or {}).values() for p in t.get("skaters", [])}
+    for pl in [x for x in pred.get("players", []) if x.get("active")][:30]:
+        lam60 = -math.log(max(1e-6, 1 - pl["pGoal"]))
+        adj = (rateSH * 60 / max(1, eH)) if pl["team"] == d["home"]["abbr"] else (rateSA * 60 / max(1, eA))
+        p_rest = 1 - math.exp(-lam60 * adj * rem / 60)
+        b = box.get(pl["id"]) or {}
+        pls.append({"id": pl["id"], "name": pl["name"], "team": pl["team"], "num": pl.get("num"), "goalsNow": b.get("g", 0),
+                    "pointsNow": b.get("pts", 0), "sogNow": b.get("sog", 0), "pGoalRest": round(p_rest, 4),
+                    "pPointRest": round(1 - math.exp(-(-math.log(max(1e-6, 1 - pl["pPoint"]))) * adj * rem / 60), 4)})
+    pls.sort(key=lambda x: -x["pGoalRest"])
+    H, A = d["home"]["abbr"], d["away"]["abbr"]
+    markets = [
+        {"key": "1", "group": "Zápas (základní doba)", "label": f"{H} vyhraje (1)", "p": pH},
+        {"key": "0", "group": "Zápas (základní doba)", "label": "Remíza po 60 min (0)", "p": pT},
+        {"key": "2", "group": "Zápas (základní doba)", "label": f"{A} vyhraje (2)", "p": pA},
+        {"key": "10", "group": "Zápas (základní doba)", "label": f"{H} nebo remíza (10)", "p": pH + pT},
+        {"key": "02", "group": "Zápas (základní doba)", "label": f"{A} nebo remíza (02)", "p": pA + pT},
+        {"key": "wH", "group": "Vítěz vč. prodloužení", "label": f"{H} vyhraje", "p": pH + pT * ot_home},
+        {"key": "wA", "group": "Vítěz vč. prodloužení", "label": f"{A} vyhraje", "p": pA + pT * (1 - ot_home)},
+        {"key": "nH", "group": "Příští gól", "label": f"Příští gól dá {H}", "p": nextH},
+        {"key": "nA", "group": "Příští gól", "label": f"Příští gól dá {A}", "p": nextA},
+        {"key": "nN", "group": "Příští gól", "label": "Už žádný gól", "p": p_none},
+    ]
+    for l in lines:
+        markets.append({"key": f"o{l['line']}", "group": "Počet gólů v zápase", "label": f"Více než {l['line']}", "p": l["over"]})
+        markets.append({"key": f"u{l['line']}", "group": "Počet gólů v zápase", "label": f"Méně než {l['line']}", "p": l["under"]})
+    for m in markets:
+        m["p"] = round(_clamp(m["p"], 0.0005, 0.9995), 4)
+        m["fair"] = round(1 / m["p"], 2)
+    return {"elapsed": round(elapsed, 1), "remaining": round(rem, 1), "expGoalsRest": {"home": round(lamH, 2), "away": round(lamA, 2)},
+            "markets": markets, "players": pls[:10], "pp": pp_note,
+            "pressure": {"home": round(rateSH * 60, 1), "away": round(rateSA * 60, 1)}}
+
+
+def _live_leg_prob(m, lm, H, A):
+    """Šance pro sázku z (live) screenshotu Tipsportu podle live modelu."""
+    if not lm or not lm.get("markets"):
+        return None
+    mk = {x["key"]: x["p"] for x in lm["markets"]}
+    kind, pick, line = m.get("kind"), str(m.get("pick")), m.get("line")
+    if kind == "1x2":
+        return mk.get(pick)
+    if kind == "winner_ot":
+        return mk.get("wH" if pick in ("home", "1") else "wA")
+    if kind == "total_goals" and line is not None:
+        k = ("o" if pick == "over" else "u") + str(float(line))
+        return mk.get(k)
+    if kind in ("player_goal",) and m.get("player"):
+        for pl in lm.get("players", []):
+            if _norm(pl["name"]).split()[-1:] == _norm(m["player"]).split()[-1:]:
+                return pl["pGoalRest"] if pl["goalsNow"] == 0 else 1.0
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2294,7 +2430,13 @@ def analyze_odds(image_b64=None, mime="image/jpeg", text=None):
         opts.sort(key=lambda g: (0 if d and g["date"] == d else 1, g["date"] or ""))
         game = opts[0]
         swap = game["home"] != H
-        pred = LEAGUE.preds.get(game["id"])
+        pred = LEAGUE.preds.get(game["id"]) or (LEAGUE.history.get(game["id"]) or (0, None))[1]
+        lm = None
+        if game.get("state") in ("LIVE", "CRIT"):
+            try:
+                lm = live_game(game["id"]).get("liveModel")
+            except Exception:
+                lm = None
         mk = []
         for m in (gm.get("markets") or [])[:80]:
             try:
@@ -2309,7 +2451,14 @@ def analyze_odds(image_b64=None, mime="image/jpeg", text=None):
                     m["team"] = "away" if m["team"] == "home" else "home"
             item = {k: m.get(k) for k in ("market", "selection", "kind", "pick", "line", "team", "player")}
             item["odds"] = odds
-            if pred:
+            if lm:
+                prob = _live_leg_prob(m, lm, game["home"], game["away"])
+                note, pl = ("LIVE – přepočteno podle stavu zápasu" if prob else "live model tuhle sázku neumí"), None
+                if prob:
+                    item.update(prob=round(prob, 4), fair=round(1 / prob, 2) if prob > 0.01 else None, ev=round(prob * odds - 1, 4))
+                item["note"] = note
+                item["live"] = True
+            elif pred:
                 try:
                     prob, note, pl = _leg_probability(m, pred)
                 except Exception:
@@ -2326,9 +2475,9 @@ def analyze_odds(image_b64=None, mime="image/jpeg", text=None):
             continue
         old = (TS_ODDS.get(game["id"]) or {}).get("markets") or []
         key = lambda x: (x.get("kind"), str(x.get("pick")), x.get("line"), x.get("team"), (x.get("player") or "").lower())
-        merged = {key(x): x for x in old}
+        merged = {} if lm else {key(x): x for x in old}
         merged.update({key(x): x for x in mk})
-        rec = {"at": now, "markets": sorted(merged.values(), key=lambda x: -(x.get("ev") if x.get("ev") is not None else -9))}
+        rec = {"at": now, "live": bool(lm), "markets": sorted(merged.values(), key=lambda x: -(x.get("ev") if x.get("ev") is not None else -9))}
         TS_ODDS[game["id"]] = rec
         out.append({"gameId": game["id"], "home": game["home"], "away": game["away"], "date": game["date"], "start": game.get("start"), **rec})
     if not out:
@@ -3358,6 +3507,9 @@ body.rails-on .hrail { display: none; }
 .pscgrid { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }
 @media (max-width: 720px) { .pscgrid { grid-template-columns: minmax(0, 1fr); } .zb { grid-template-columns: 110px 1fr 48px; font-size: 12px; } }
 .scoutai { border-color: rgba(76,195,255,.35); background: linear-gradient(180deg, rgba(47,123,255,.12), rgba(12,16,23,.9)); }
+.lbin { width: 78px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line2); background: rgba(255,255,255,.06); color: var(--text); font: inherit; font-weight: 800; text-align: center; }
+.lbet { border-color: rgba(53,211,154,.35); }
+@media (max-width: 720px) { .lbet th:nth-child(3), .lbet td:nth-child(3) { display: none; } .lbet td, .lbet th { padding-left: 6px; padding-right: 6px; } .lbin { width: 64px; } }
 </style>
 </head>
 <body>
@@ -4912,6 +5064,80 @@ function liveCounts(d, evs) {
     if (e.type === "goal") { t.g++; t.sog++; } else if (e.type === "shot-on-goal") t.sog++; else if (e.type === "penalty") t.pen++; else if (e.type === "hit") t.hits++; });
   return c;
 }
+
+// ---------- LIVE sázky: šance podle aktuálního stavu + tvoje kurzy z Tipsportu ----------
+function lbetKey(k) { return `lodd:${LV.id}:${k}`; }
+function lbetEv(p, o) { return o > 1 ? p * o - 1 : null; }
+function renderLiveBets() {
+  const el = $("lbet"), d = LV.data;
+  if (!el || !d) return;
+  const lm = d.liveModel;
+  if (!["LIVE", "CRIT"].includes(d.state)) {
+    el.innerHTML = ["FUT", "PRE"].includes(d.state) ? `<div class="card"><b>💰 Live sázky</b><p class="help" style="margin:4px 0 0">Jakmile zápas začne, objeví se tu šance přepočítané <b>každých 8 vteřin podle skóre, času a střel</b>, a když zadáš (nebo nahraješ screenshotem) live kurzy z Tipsportu, ukážu, co se právě vyplatí.</p></div>` : "";
+    return;
+  }
+  if (!lm) { el.innerHTML = `<div class="card"><b>💰 Live sázky</b><p class="help">K tomuto zápasu nemám předzápasový model, live šance nejdou spočítat.</p></div>`; return; }
+  if (lm.ot) { el.innerHTML = `<div class="card"><b>💰 Live sázky</b><p class="help">${esc(lm.note)}</p></div>`; return; }
+  const keys = lm.markets.map((m) => m.key).join(",");
+  if (el.dataset.keys !== keys) {
+    el.dataset.keys = keys;
+    let grp = "";
+    el.innerHTML = `<div class="card lbet"><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <b style="font-size:18px">💰 Live sázky – co se teď vyplatí</b>
+        <label class="btn primary" style="cursor:pointer">📷 Nahrát live kurzy z Tipsportu<input type="file" id="lbfile" accept="image/*" style="display:none"></label></div>
+      <p class="help" style="margin:6px 0 8px">Šance se přepočítávají <b>každých 8 vteřin</b> podle skóre, zbývajícího času, střel (kdo víc tlačí) a přesilovek. Do sloupce <b>Kurz Tipsport</b> napiš live kurz z aplikace – nebo nahraj screenshot live sázek a AI je doplní sama.
+        <b>Hodnota</b> = jestli se sázka podle modelu vyplatí (zelená = ano). Live kurzy se mění každou chvíli, vsaď jen když je hodnota jasně kladná.</p>
+      <div id="lbinfo" class="help"></div><div id="lbbest"></div>
+      <div class="tablewrap" style="background:none;margin-top:8px"><table class="t"><thead><tr><th class="left">Sázka</th><th>Šance teď</th><th>Férový kurz</th><th>Kurz Tipsport</th><th>Hodnota</th></tr></thead><tbody>
+      ${lm.markets.map((m) => { const g = m.group !== grp ? ((grp = m.group), `<tr><td class="left" colspan="5" style="color:var(--cyan);font-weight:800;padding-top:12px">${esc(m.group)}</td></tr>`) : "";
+        return g + `<tr><td class="left">${esc(m.label)}</td><td id="lbp-${m.key}"></td><td id="lbf-${m.key}"></td>
+          <td><input class="lbin" data-k="${m.key}" inputmode="decimal" placeholder="kurz" value="${esc(store.get(lbetKey(m.key)) || "")}"></td><td id="lbe-${m.key}"></td></tr>`; }).join("")}
+      </tbody></table></div>
+      <h3 style="margin:16px 0 4px;font-size:16px">⚡ Kdo ještě dá gól</h3><p class="help" style="margin:0 0 6px">Šance, že hráč dá gól (nebo bod) <b>ve zbytku základní doby</b>. Bere jeho formu, tempo jeho týmu v tomto zápase a zbývající čas.</p>
+      <div id="lbpl"></div></div>`;
+    el.querySelectorAll(".lbin").forEach((i) => (i.oninput = () => { store.set(lbetKey(i.dataset.k), i.value.replace(",", ".")); updLiveBets(); }));
+    $("lbfile").onchange = (e) => e.target.files[0] && liveOddsShot(e.target.files[0]);
+  }
+  updLiveBets();
+}
+function updLiveBets() {
+  const lm = LV.data?.liveModel;
+  if (!lm || !lm.markets || !$("lbinfo")) return;
+  const H = LV.data.home.abbr, A = LV.data.away.abbr;
+  $("lbinfo").innerHTML = `Odehráno <b>${Math.round(lm.elapsed)}′</b>, zbývá <b>${Math.round(lm.remaining)}′</b> · do konce čekám ještě <b>${H} ${lm.expGoalsRest.home}</b> a <b>${A} ${lm.expGoalsRest.away}</b> gólu ·
+    tempo střel (na 60 min): ${H} ${lm.pressure.home}, ${A} ${lm.pressure.away}${lm.pp ? ` · <b style="color:var(--gold)">⚡ ${esc(lm.pp)}</b>` : ""}`;
+  const best = [];
+  lm.markets.forEach((m) => {
+    const o = parseFloat(store.get(lbetKey(m.key)) || ""), ev = lbetEv(m.p, o);
+    $("lbp-" + m.key).innerHTML = `<b>${pc(m.p)}</b>`;
+    $("lbf-" + m.key).textContent = m.fair > 50 ? ">50" : m.fair.toFixed(2);
+    $("lbe-" + m.key).innerHTML = ev == null ? `<small class="muted">zadej kurz</small>` : `<span class="pill ${ev > 0.03 ? "good" : ev < -0.03 ? "hot" : ""}">${ev > 0 ? "+" : ""}${Math.round(ev * 100)} %</span>`;
+    if (ev != null && ev > 0.03) best.push({ ...m, o, ev });
+  });
+  best.sort((a, b) => b.ev - a.ev);
+  $("lbbest").innerHTML = best.length ? `<div class="retro" style="border-color:rgba(53,211,154,.5)"><b>✅ Teď se podle modelu vyplatí:</b> ${best.slice(0, 4).map((b) => `<b>${esc(b.label)}</b> @ ${b.o.toFixed(2)} (<span class="okc">+${Math.round(b.ev * 100)} %</span>)`).join(" · ")}</div>` : "";
+  $("lbpl").innerHTML = lm.players.slice(0, 8).map((p) => `<div class="gk"><span style="display:flex;gap:8px;align-items:center">${jersey(p.team, p.num, 30)}<span><b class="pname-link" data-player="${p.id}:${p.team}">${esc(p.name)}</b><br><small class="muted">${p.team} · teď ${p.goalsNow} g, ${p.pointsNow} b., ${p.sogNow} střel</small></span></span>
+    <span style="text-align:right"><b style="color:var(--gold)">${pc(p.pGoalRest)}</b> <small class="muted">gól · fér. ${(1 / Math.max(0.01, p.pGoalRest)).toFixed(2)}</small><br><small class="muted">bod ${pc(p.pPointRest)}</small></span></div>`).join("");
+}
+async function liveOddsShot(f) {
+  $("lbinfo").innerHTML = `<span class="typing"><span></span><span></span><span></span></span> AI čte live kurzy ze screenshotu…`;
+  const img = await new Promise((res) => { const im = new Image(), u = URL.createObjectURL(f); im.onload = () => { const k = Math.min(1, 1800 / Math.max(im.width, im.height)), c = document.createElement("canvas"); c.width = im.width * k; c.height = im.height * k; c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.88)); }; im.src = u; });
+  try {
+    const j = await fetch("/model/tsodds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: img }) }).then((r) => r.json());
+    const g = (j.games || []).find((x) => x.gameId === LV.id);
+    if (!g) throw new Error(j.error || "Na screenshotu jsem nenašel kurzy k tomuto zápasu.");
+    let n = 0;
+    g.markets.forEach((m) => {
+      let k = null; const pick = String(m.pick);
+      if (m.kind === "1x2" && ["1", "0", "2", "10", "02"].includes(pick)) k = pick;
+      else if (m.kind === "winner_ot") k = pick === "home" || pick === "1" ? "wH" : "wA";
+      else if (m.kind === "total_goals" && m.line != null) k = (m.pick === "over" ? "o" : "u") + (+m.line);
+      if (k && document.querySelector(`.lbin[data-k="${k}"]`)) { store.set(lbetKey(k), String(m.odds)); document.querySelector(`.lbin[data-k="${k}"]`).value = m.odds; n++; }
+    });
+    updLiveBets();
+    $("lbinfo").insertAdjacentHTML("afterbegin", `<b class="okc">✅ Doplnil jsem ${n} kurzů ze screenshotu.</b> `);
+  } catch (e) { $("lbinfo").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+}
 function renderLive() {
   const d = LV.data, H = d.home.abbr, A = d.away.abbr;
   const fut = ["FUT", "PRE"].includes(d.state), fin = ["FINAL", "OFF"].includes(d.state);
@@ -4928,6 +5154,7 @@ function renderLive() {
     <div class="mbar"><span style="color:${hc}">${H}</span><div class="bar"><i id="mbh" style="width:50%;background:${hc}"></i><i id="mba" style="width:50%;background:${ac === "#1f2937" ? "#e8edf4" : ac}"></i></div><span>${A}</span></div>
     <p class="help" style="margin-top:4px;text-align:center">Pruh ukazuje <b>tlak na bránu</b> – jaký podíl ze všech střel na branku vystřelil který tým. Čím delší barva, tím víc tým útočí.</p>
     <div class="lticker"><div class="track" id="ltick"></div></div>
+    <div id="lbet" style="margin-top:14px"></div>
     ${fut ? `<div class="card" style="margin-top:14px;text-align:center"><h3 class="display" style="font-size:40px;margin:6px 0">Zápas ještě nezačal</h3>
       <div class="countdown" data-start="${d.start}" style="font-size:20px"></div><p class="help">Jakmile začne, uvidíš tady živě puk, střely a vyloučení. Mezitím se podívej na <a href="#zapas-${d.id}">předpověď zápasu</a>.</p></div>` : ""}
     <div class="lfilters">
@@ -5022,6 +5249,7 @@ function updatePanels(upto) {
   const box = (lab, now, exp) => `<div><small>${lab}</small><b>${now}</b><small>${pace(now) != null && em < 60 ? `tempo na <b style="font-size:15px;display:inline;font-family:Inter">${pace(now).toFixed(0)}</b> za zápas · ` : ""}${exp != null ? `model čekal ${exp.toFixed(1)}` : ""}</small></div>`;
   $("lpace").innerHTML = box("Střely na branku celkem", shotsNow, pre?.shots.total) + box("Vyloučení celkem", pensNow, pre?.pens.total) + box("Góly celkem", goalsNow, pre?.goals.total) +
     `<div><small>Odehráno</small><b>${Math.round(em)}′</b><small>z 60 minut</small></div>`;
+  if (!replay) renderLiveBets();
   // hráči
   if (!replay) $("lplayers").innerHTML = [H, A].map((t) => {
     const p = d.players[t] || { skaters: [], goalies: [] };
