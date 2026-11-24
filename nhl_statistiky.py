@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 import time
 import urllib.error
 import urllib.parse
@@ -153,6 +154,9 @@ class League:
         self.roster = {}  # abbr -> {"skaters": {id: name}, "goalies": [...]}
         self.lg = {"shots": 28.5, "goals": 3.05, "pens": 3.4, "hits": 22, "blk": 14, "ppg": 0.7, "ppConv": 0.2}
         self.backtest = None
+        self.injuries = {}
+        self.special = {}
+        self.history = {}  # gid -> předpověď (i pro zápasy, které už začaly/skončily)
         self.preds = {}  # gid -> předpověď
         self.upcoming = []  # nadcházející zápasy
         self.season = None
@@ -245,6 +249,10 @@ class League:
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(load_roster, list(info)))
 
+        st.update(phase="Stahuji marodku a týmové statistiky…")
+        injuries = load_injuries(info)
+        special = load_special(self.season, info)
+
         st.update(phase="Počítám předpovědi…")
         teams = build_team_records(self.games, pens)
         lg = league_averages(self.games, pens)
@@ -254,13 +262,20 @@ class League:
         for g in upcoming:
             if g["home"] in teams and g["away"] in teams:
                 try:
-                    preds[g["id"]] = predict_game(g, teams, lg, roster, info)
+                    preds[g["id"]] = predict_game(g, teams, lg, roster, info, injuries, special)
                 except Exception as e:
                     print("Předpověď selhala", g["id"], e, flush=True)
+        self.pens = pens
 
         with self.lock:
             self.info, self.roster, self.teams, self.lg = info, roster, teams, lg
             self.upcoming, self.preds = upcoming, preds
+            self.injuries, self.special = injuries, special
+            now = time.time()
+            for gid, p in preds.items():
+                self.history[gid] = (now, p)
+            for gid in [k for k, v in self.history.items() if now - v[0] > 3 * 86400]:
+                del self.history[gid]
             self.ready = True
             self.updated = time.time()
         st.update(phase="Počítám zpětný test přesnosti…")
@@ -294,6 +309,32 @@ class League:
                 ids.add(r["gameId"])
             start += len(rows)
         return pens, ids
+
+    def retro(self, gid):
+        """Předpověď pro zápas, který už začal/skončil – jen z dat před zápasem."""
+        if gid in self.history:
+            return self.history[gid][1]
+        try:
+            box = json.loads(http_get(NHL_API + f"gamecenter/{gid}/boxscore"))
+        except Exception:
+            return None
+        d = box.get("gameDate")
+        H, A = box["homeTeam"]["abbrev"], box["awayTeam"]["abbrev"]
+        prior = {k: g for k, g in self.games.items() if g["date"] < d}
+        if len(prior) < 40:
+            return None
+        teams = build_team_records(prior, getattr(self, "pens", {}))
+        lg = league_averages(prior, getattr(self, "pens", {}))
+        info = self.info
+        gg = {"id": gid, "home": H, "away": A, "date": d, "start": box.get("startTimeUTC"), "state": box.get("gameState"),
+              "venue": _abbr(box.get("venue")),
+              "homeName": (info.get(H) or {}).get("name", H), "awayName": (info.get(A) or {}).get("name", A),
+              "homeLogo": box["homeTeam"].get("darkLogo") or box["homeTeam"].get("logo"),
+              "awayLogo": box["awayTeam"].get("darkLogo") or box["awayTeam"].get("logo"), "odds": {}}
+        p = predict_game(gg, teams, lg, self.roster, info, self.injuries, self.special)
+        p["retro"] = True
+        self.history[gid] = (time.time(), p)
+        return p
 
     # -- zpětný test --------------------------------------------------------------
     def run_backtest(self, pens, days=14):
@@ -387,6 +428,57 @@ class League:
 LEAGUE = League()
 
 
+def _norm(name):
+    n = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z ]", "", n).strip()
+
+
+OUT_STATUSES = ("injured reserve", "out", "long-term injured reserve", "ltir", "suspension", "suspended")
+
+
+def load_injuries(info):
+    """Marodka z ESPN: {abbr: {normalizované jméno: {...}}}"""
+    try:
+        d = json.loads(http_get("https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/injuries"))
+    except Exception as e:
+        print("Marodka nedostupná:", e, flush=True)
+        return {}
+    by_name = {_norm(v["name"]): ab for ab, v in info.items()}
+    out = {}
+    for t in d.get("injuries") or []:
+        ab = by_name.get(_norm(t.get("displayName")))
+        if not ab:
+            continue
+        for inj in t.get("injuries") or []:
+            a = inj.get("athlete") or {}
+            st = str(inj.get("status") or "")
+            out.setdefault(ab, {})[_norm(a.get("displayName"))] = {
+                "name": a.get("displayName"), "status": st, "out": st.lower() in OUT_STATUSES,
+                "comment": inj.get("shortComment") or "", "date": (inj.get("date") or "")[:10],
+            }
+    return out
+
+
+def load_special(season, info):
+    """Přesilovky, oslabení, vhazování z NHL stats API."""
+    if not season:
+        return {}
+    by_name = {_norm(v["name"]): ab for ab, v in info.items()}
+    try:
+        d = get_json(f"team/summary?cayenneExp=seasonId={season}%20and%20gameTypeId=2", base=STATS_REST)
+    except Exception:
+        return {}
+    out = {}
+    for r in d.get("data", []):
+        ab = by_name.get(_norm(r.get("teamFullName")))
+        if ab:
+            out[ab] = {"pp": r.get("powerPlayPct"), "pk": r.get("penaltyKillPct"), "fo": r.get("faceoffWinPct"),
+                       "gf": r.get("goalsForPerGame"), "ga": r.get("goalsAgainstPerGame"),
+                       "sf": r.get("shotsForPerGame"), "sa": r.get("shotsAgainstPerGame"), "pts": r.get("points"),
+                       "gp": r.get("gamesPlayed"), "w": r.get("wins"), "l": r.get("losses"), "otl": r.get("otLosses")}
+    return out
+
+
 def compact_game(box):
     def side(key):
         t = box[key]
@@ -455,10 +547,27 @@ def league_averages(games, pens):
             "ppConv": round(ppg / max(p, 0.1), 4)}
 
 
+REG_BOOKS = {"veikkaus", "doxxbet"}  # tyto sázkovky v NHL datech uvádějí kurz na základní hrací dobu (1X2)
+
+
+def _dec(v):
+    v = str(v or "").strip()
+    try:
+        if v.startswith(("+", "-")) and "." not in v:
+            a = int(v)
+            return round(1 + (a / 100 if a > 0 else 100 / abs(a)), 2)
+        x = float(v)
+        return x if x > 1 else None
+    except Exception:
+        return None
+
+
 def load_upcoming(info):
     d = get_json("schedule/now")
     tip_id = 3
+    partners = {}
     for p in d.get("oddsPartners") or []:
+        partners[p.get("partnerId")] = {"name": p.get("name"), "country": p.get("country"), "url": p.get("siteUrl")}
         if str(p.get("name", "")).lower().startswith("tipsport"):
             tip_id = p.get("partnerId", tip_id)
     out = []
@@ -478,6 +587,15 @@ def load_upcoming(info):
                             return v
                 return None
 
+            books = []
+            hmap = {o.get("providerId"): _dec(o.get("value")) for o in ht.get("odds") or []}
+            amap = {o.get("providerId"): _dec(o.get("value")) for o in at.get("odds") or []}
+            for pid, info_p in partners.items():
+                if hmap.get(pid) and amap.get(pid):
+                    nm = info_p["name"] or str(pid)
+                    books.append({"name": nm, "country": info_p["country"], "home": hmap[pid], "away": amap[pid],
+                                  "reg": nm.lower() in REG_BOOKS})
+
             out.append({
                 "id": g["id"], "start": g.get("startTimeUTC"), "state": g.get("gameState"),
                 "date": day.get("date"), "venue": _abbr(g.get("venue")),
@@ -487,7 +605,7 @@ def load_upcoming(info):
                 "homeLogo": ht.get("darkLogo") or ht.get("logo"),
                 "awayLogo": at.get("darkLogo") or at.get("logo"),
                 "score": [ht.get("score"), at.get("score")],
-                "odds": {"home": odd(ht), "away": odd(at), "provider": "Tipsport"},
+                "odds": {"home": odd(ht), "away": odd(at), "provider": "Tipsport", "books": books},
             })
             added = True
         if added:
@@ -659,7 +777,9 @@ def goalie_info(recs, roster_goalies, game_date):
     return {"goalies": goalies[:3], "b2b": rest == 0, "restDays": rest}
 
 
-def predict_game(g, teams, lg, roster, info):
+def predict_game(g, teams, lg, roster, info, injuries=None, special=None):
+    injuries = injuries or {}
+    special = special or {}
     home, away, date = g["home"], g["away"], g["date"]
     rh, ra = teams.get(home, []), teams.get(away, [])
     ph, pa = team_profile(rh, lg), team_profile(ra, lg)
@@ -699,6 +819,20 @@ def predict_game(g, teams, lg, roster, info):
 
     players = (player_projections(home, rh, ph, gH, sH, True, rosH.get("skaters", {})) +
                player_projections(away, ra, pa, gA, sA, False, rosA.get("skaters", {})))
+    inj_list = {home: [], away: []}
+    for p in players:
+        inj = (injuries.get(p["team"]) or {}).get(_norm(p["name"]))
+        if inj:
+            p["injury"] = inj
+            if inj["out"]:
+                p["active"] = False
+            inj_list[p["team"]].append({"name": p["name"], "status": inj["status"], "comment": inj["comment"],
+                                        "out": inj["out"], "ppg": round(p["pts"] / max(1, p["gp"]), 2), "pts": p["pts"]})
+    for t in (home, away):  # zranění, kteří v našich datech nejsou (dlouhodobě mimo)
+        known = {_norm(x["name"]) for x in inj_list[t]}
+        for k, inj in (injuries.get(t) or {}).items():
+            if k not in known:
+                inj_list[t].append({"name": inj["name"], "status": inj["status"], "comment": inj["comment"], "out": inj["out"], "ppg": None, "pts": None})
     players.sort(key=lambda p: (-p["active"], -p["pPoint"]))
 
     # další trhy: hity, bloky, góly v přesilovce, první gól
@@ -745,7 +879,8 @@ def predict_game(g, teams, lg, roster, info):
             f"{team} {vz} dává {p['gf'][v]:.2f} gólu na zápas, {opp} {ovz} dostává {po['ga'][ov]:.2f} → čekáme {gx:.2f}.",
             f"{team} {vz} jde na trestnou lavici {p['pt'][v]:.1f}× za zápas, soupeři {opp} {ovz} vynucují {po['pd'][ov]:.1f}× → čekáme {n:.1f} vyloučení.",
             f"Forma posledních 5 zápasů: {p['form']['last5']} (V-P-PP), skóre {p['form']['gf5']}:{p['form']['ga5']}, střely {p['form']['sf5']}.",
-        ]
+        ] + ([f"Marodka {team}: " + ", ".join(f"{x['name']} ({x['status']})" for x in (injuries.get(team) or {}).values()) + "."]
+             if injuries.get(team) else [])
 
     odds = g.get("odds") or {}
     value = {}
@@ -753,6 +888,10 @@ def predict_game(g, teams, lg, roster, info):
         o = odds.get(side)
         if o:
             value[side] = round(prob * o - 1, 4)
+    for b in odds.get("books") or []:
+        ph_, pa_ = (p_home, p_away) if b.get("reg") else (win_home, win_away)
+        b["pHome"], b["pAway"] = round(ph_, 4), round(pa_, 4)
+        b["evHome"], b["evAway"] = round(ph_ * b["home"] - 1, 4), round(pa_ * b["away"] - 1, 4)
 
     return {
         "id": g["id"], "home": home, "away": away, "date": date, "start": g.get("start"),
@@ -774,6 +913,8 @@ def predict_game(g, teams, lg, roster, info):
         },
         "h2h": h2h, "players": players, "games": {"home": len(rh), "away": len(ra)},
         "extra": extra,
+        "injuries": inj_list,
+        "special": {home: special.get(home), away: special.get(away)},
     }
 
 
@@ -838,6 +979,41 @@ def shotmap(team, n_games=10):
     data = {"team": team, "games": len(gids), "for": sf, "against": sa}
     _shotmaps[team] = (time.time(), data)
     return data
+
+
+def player_log(team, pid):
+    recs = LEAGUE.teams.get(team, [])
+    games = []
+    for r in recs:
+        for p in r["players"]:
+            if p["id"] == pid:
+                games.append({"date": r["date"], "opp": r["opp"], "home": r["home"], "g": p["g"], "a": p["a"], "pts": p["pts"], "num": p.get("num"),
+                              "sog": p["sog"], "toi": p["toi"], "pim": p["pim"], "hits": p["hits"], "res": "V" if r["gf"] > r["ga"] else "P",
+                              "score": f"{r['gf']}:{r['ga']}"})
+    games = games[:20]
+    name = (LEAGUE.roster.get(team, {}).get("skaters", {}) or {}).get(pid)
+    inj = (LEAGUE.injuries.get(team) or {}).get(_norm(name)) if name else None
+    nxt = None
+    for gp_ in LEAGUE.preds.values():
+        for pl in gp_["players"]:
+            if pl["id"] == pid:
+                nxt = {"game": f"{gp_['home']} – {gp_['away']}", "gid": gp_["id"], "start": gp_.get("start"),
+                       "pPoint": pl["pPoint"], "pGoal": pl["pGoal"], "expShots": pl["expShots"], "p2Points": pl.get("p2Points")}
+                break
+        if nxt:
+            break
+    n = len(games) or 1
+    vs = {}
+    for g in games:
+        v = vs.setdefault(g["opp"], [0, 0])
+        v[0] += 1
+        v[1] += g["pts"]
+    return {"id": pid, "team": team, "name": name, "injury": inj, "games": games[::-1], "next": nxt,
+            "num": next((g["num"] for g in games if g.get("num") is not None), None),
+            "avg": {"pts": round(sum(g["pts"] for g in games) / n, 2), "sog": round(sum(g["sog"] for g in games) / n, 2),
+                    "toi": round(sum(g["toi"] for g in games) / n), "pointRate": round(sum(1 for g in games if g["pts"]) / n, 3)},
+            "home": {"gp": sum(1 for g in games if g["home"]), "pts": sum(g["pts"] for g in games if g["home"])},
+            "away": {"gp": sum(1 for g in games if not g["home"]), "pts": sum(g["pts"] for g in games if not g["home"])}}
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1139,8 @@ def live_game(gid):
             "desc": det.get("descKey"), "dur": det.get("duration"), "shotType": det.get("shotType"),
             "reason": det.get("reason"), "sit": p.get("situationCode"),
             "score": [det.get("homeScore"), det.get("awayScore")] if t == "goal" else None,
+            "clip": det.get("highlightClipSharingUrl") if t == "goal" else None,
+            "side": p.get("homeTeamDefendingSide"),
         })
     players = {}
     for key in ("homeTeam", "awayTeam"):
@@ -1123,6 +1301,16 @@ def chat_context(gid=None):
                            (f"Vyloučení {A}", p["pens"]["away"]), ("Vyloučení celkem", p["pens"]["total"])):
             exp = f"očekáváno {blk['exp']}; " if "exp" in blk else ""
             lines.append(f"{label}: {exp}" + "; ".join(f"přes {l['line']} {_p(l['over'])}" for l in blk["lines"]))
+        for t in (H, A):
+            sp = (p.get("special") or {}).get(t) or {}
+            if sp:
+                lines.append(f"{t} sezóna: přesilovka {_p(sp.get('pp') or 0)}, oslabení {_p(sp.get('pk') or 0)}, vhazování {_p(sp.get('fo') or 0)}.")
+            inj = (p.get("injuries") or {}).get(t) or []
+            if inj:
+                lines.append(f"Marodka {t}: " + "; ".join(f"{i['name']} – {i['status']}{' (' + i['comment'] + ')' if i['comment'] else ''}" for i in inj))
+        books = (p.get("odds") or {}).get("books") or []
+        if books:
+            lines.append("Kurzy sázkovek (domácí/hosté): " + "; ".join(f"{b['name']}{' (základní doba)' if b['reg'] else ''} {b['home']}/{b['away']}" for b in books))
         x = p.get("extra")
         if x:
             lines.append(f"Hity: {H} {x['hits']['home']['exp']}, {A} {x['hits']['away']['exp']}, celkem {x['hits']['total']['exp']}; "
@@ -1160,14 +1348,74 @@ DATA:
 {context}"""
 
 
-def chat(messages, gid=None):
+_goal_ai = {}
+
+
+def goal_ai(gid, eid):
+    key = (gid, eid)
+    if key in _goal_ai:
+        return _goal_ai[key]
+    if not gemini_key():
+        return {"error": "AI není zapnutá."}
+    d = live_game(gid)
+    evs = d["events"]
+    idx = next((i for i, e in enumerate(evs) if e["id"] == eid and e["type"] == "goal"), None)
+    if idx is None:
+        return {"error": "Gól nenalezen."}
+    e = evs[idx]
+    home = d["home"]["abbr"]
+    # vzdálenost od branky (útočí se na branku na straně soupeře)
+    goal_x = 89
+    is_home = e["team"] == home
+    attack_right = (is_home and e.get("side") == "left") or (not is_home and e.get("side") == "right")
+    gx = goal_x if attack_right else -goal_x
+    dist = round(math.hypot((e["x"] or 0) - gx, e["y"] or 0) * 0.3048, 1) if e["x"] is not None else None
+
+    def tsec(ev):
+        m, s_ = (ev["time"] or "0:0").split(":")
+        return (ev["per"] - 1) * 1200 + int(m) * 60 + int(s_)
+
+    t0 = tsec(e)
+    before = [x for x in evs[max(0, idx - 8):idx] if t0 - tsec(x) <= 25]
+    sit = e.get("sit") or "1551"
+    sk_h, sk_a = int(sit[2]), int(sit[1])
+    if is_home:
+        situation = "přesilovka" if sk_h > sk_a else ("oslabení" if sk_h < sk_a else "plný počet hráčů")
+        empty = sit[0] == "0"
+    else:
+        situation = "přesilovka" if sk_a > sk_h else ("oslabení" if sk_a < sk_h else "plný počet hráčů")
+        empty = sit[3] == "0"
+    pre = (d.get("pre") or {}).get("players", {})
+    scorer = e.get("who") or {}
+    sp = pre.get(scorer.get("id")) if scorer else None
+    lines = [
+        f"Zápas {d['home']['abbr']} – {d['away']['abbr']}, {e['per']}. třetina, čas {e['time']}, gól dal tým {e['team']}.",
+        f"Střelec: {scorer.get('name')} (#{scorer.get('num')}), typ střely: {e.get('shotType') or 'neuvedeno'}, vzdálenost od branky asi {dist} m.",
+        f"Asistence: {', '.join(a['name'] for a in e.get('extra') or []) or 'bez asistence'}.",
+        f"Herní situace: {situation}{', do prázdné branky' if empty else ''}. Stav po gólu {e['score'][0]}:{e['score'][1]} (domácí:hosté)." if e.get("score") else f"Herní situace: {situation}.",
+        "Akce posledních 25 sekund před gólem: " + ("; ".join(f"{x['time']} {x['type']} {x['team'] or ''} {(x.get('who') or {}).get('name', '')}" for x in before) or "žádné zaznamenané"),
+    ]
+    if sp:
+        lines.append(f"Model před zápasem dával střelci šanci na bod {_p(sp['pPoint'])} a čekal {sp['expShots']} střel.")
+    prompt = ("Vysvětli česky, jednoduše a zajímavě (4–6 vět) jak a proč tento gól padl: odkud se střílelo, jestli šlo o dorážku "
+              "(střela těsně před gólem), protiútok (zisk puku/vhazování těsně předtím), přesilovku, kdo se na něm podílel a co to "
+              "znamenalo pro zápas. Video nevidíš, vycházej jen z těchto dat a na konci jednou krátkou větou řekni, že popis je z dat zápasu.\n\n"
+              + "\n".join(lines))
+    res = chat([{"role": "user", "content": prompt}], None, system_override=True)
+    if "reply" in res:
+        _goal_ai[key] = res
+    return res
+
+
+def chat(messages, gid=None, system_override=False):
     key = gemini_key()
     if not key:
         return {"error": "AI zatím není zapnutá – chybí klíč GEMINI_API_KEY v nastavení Renderu."}
-    if not LEAGUE.ready:
+    if not LEAGUE.ready and not system_override:
         return {"error": "Data se ještě načítají, zkus to za chvilku."}
     now = datetime.datetime.now(PRAGUE).strftime("%d.%m.%Y %H:%M")
-    system = SYSTEM_PROMPT.format(now=now, context=chat_context(gid))
+    system = ("Jsi hokejový komentátor NHL. Odpovídáš česky, přesně podle dat, nic si nevymýšlíš." if system_override
+              else SYSTEM_PROMPT.format(now=now, context=chat_context(gid)))
     contents = []
     for m in messages[-12:]:
         role = "model" if m.get("role") == "assistant" else "user"
@@ -1276,6 +1524,34 @@ class Handler(BaseHTTPRequestHandler):
             LEAGUE.ensure()
             self._send(200, b"ok", "text/plain")
             return
+        if u.path == "/model/player":
+            try:
+                pid = int(q.get("id", ["0"])[0])
+            except ValueError:
+                pid = 0
+            team = q.get("team", [""])[0].upper()
+            self._json(player_log(team, pid))
+            return
+        if u.path == "/img":
+            src = q.get("u", [""])[0]
+            if not src.startswith("https://assets.nhle.com/"):
+                self._send(400, b"bad", "text/plain")
+                return
+            try:
+                data = nhl_get(src[len("https://assets.nhle.com/"):], base="https://assets.nhle.com/")
+                ctype = "image/svg+xml" if src.endswith(".svg") else "image/png"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self._send(404, b"", "text/plain")
+            return
+        if u.path == "/model/injuries":
+            self._json(LEAGUE.injuries)
+            return
         if u.path == "/model/shotmap":
             team = q.get("team", [""])[0].upper()
             if not (team.isalpha() and len(team) == 3) or not LEAGUE.ready:
@@ -1290,12 +1566,17 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 gid = 0
             p = LEAGUE.preds.get(gid)
+            if not p and LEAGUE.ready:
+                try:
+                    p = LEAGUE.retro(gid)
+                except Exception as e:
+                    print("retro selhalo", gid, e, flush=True)
             if p:
                 self._json(p)
             elif not LEAGUE.ready:
                 self._json({"loading": True, **LEAGUE.status()})
             else:
-                self._json({"error": "Pro tento zápas není předpověď (možná už začal nebo skončil)."}, 404)
+                self._json({"error": "Pro tento zápas se nepodařilo spočítat předpověď."}, 404)
             return
         if u.path.startswith("/api/"):
             path = self.path[len("/api/"):]
@@ -1315,7 +1596,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"Not found", "text/plain")
 
     def do_POST(self):
-        if self.path != "/model/chat":
+        if self.path not in ("/model/chat", "/model/goalai"):
             self._send(404, b"Not found", "text/plain")
             return
         try:
@@ -1339,6 +1620,13 @@ class Handler(BaseHTTPRequestHandler):
             gid = int(gid) if gid else None
         except (TypeError, ValueError):
             gid = None
+        if self.path == "/model/goalai":
+            try:
+                res = goal_ai(gid, int(body.get("eventId")))
+            except Exception as e:
+                res = {"error": f"Rozbor se nepovedl: {e}"}
+            self._json(res, 200 if "reply" in res else 503)
+            return
         res = chat(body.get("messages") or [], gid)
         self._json(res, 200 if "reply" in res else 503)
 
@@ -1364,8 +1652,25 @@ self.addEventListener('activate', e => self.clients.claim());
 self.addEventListener('fetch', e => {});"""
 
 
+def keep_alive():
+    """Na Renderu zdarma server po 15 min nečinnosti usne – každých 10 min se sám „šťouchne“ přes veřejnou adresu."""
+    url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KEEPALIVE_URL")
+    if not url:
+        return
+
+    def run():
+        while True:
+            time.sleep(600)
+            try:
+                http_get(url.rstrip("/") + "/ping", timeout=30)
+            except Exception as e:
+                print("keep-alive:", e, flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def main():
     LEAGUE.ensure()  # začni stahovat data hned po startu
+    keep_alive()
     if os.environ.get("PORT"):
         port = int(os.environ["PORT"])
         server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
@@ -1394,7 +1699,7 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NHL Predikce – body, střely, vyloučení, kurzy</title>
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#070b14">
+<meta name="theme-color" content="#120822">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" href="/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1402,7 +1707,7 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-title" content="NHL Predikce">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Caveat:wght@600&family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #070b14; --bg2: #0c1322; --card: rgba(18, 27, 46, .78); --card2: #152038; --line: rgba(148, 163, 184, .14);
@@ -1637,7 +1942,7 @@ details.gloss dd { margin: 0; color: #c3cee0; line-height: 1.55; }
 .hero2 .backword { position: absolute; left: 50%; top: 44%; transform: translate(-50%, -50%); font-family: Anton, Impact, sans-serif;
   font-size: clamp(160px, 30vw, 460px); line-height: 1; color: transparent; -webkit-text-stroke: 2px rgba(255,255,255,.09); letter-spacing: .02em;
   pointer-events: none; white-space: nowrap; will-change: transform; user-select: none; }
-.hero2 > *:not(.stage3d):not(#frost):not(.backword):not(.spot) { position: relative; z-index: 3; }
+.hero2 > *:not(.stage3d):not(#frost):not(.backword):not(.spot):not(.sky):not(.sun):not(.skyline) { position: relative; z-index: 3; }
 .hero2 h1 .ln { display: block; overflow: hidden; padding-top: .08em; margin-top: -.08em; }
 .hero2 h1 .ln > i { display: block; font-style: normal; transform: translateY(110%); animation: lineup 1s cubic-bezier(.2,.9,.2,1) forwards; }
 .hero2 h1 .ln:nth-child(2) > i { animation-delay: .15s; }
@@ -1875,17 +2180,156 @@ td.gold { color: var(--gold); font-weight: 800; }
   #chat { right: 6px; bottom: 6px; height: calc(100vh - 20px); }
   #chatbtn { right: 14px; bottom: 14px; }
 }
+/* ================= NHL TÉMA (televizní grafika) ================= */
+:root {
+  --bg: #05070b; --bg2: #0b0f16; --card: rgba(16, 21, 30, .82); --card2: #141b26;
+  --line: rgba(200, 215, 235, .10); --line2: rgba(200, 215, 235, .20); --text: #f4f7fb; --muted: #8d9aae;
+  --cyan: #4cc3ff; --blue: #2f7bff; --violet: #b9c6d8; --gold: #ffd166; --orange: #ff8a3d; --green: #35d39a; --red: #ff2d3d;
+  --home: #4cc3ff; --away: #e8edf4;
+  --sunset: linear-gradient(180deg, #ffffff 0%, #dfe7f1 45%, #9fb0c6 100%);
+  --brand: linear-gradient(135deg, #2f7bff, #0d47c9);
+}
+body { background: radial-gradient(1100px 520px at 50% -12%, rgba(76,195,255,.12), transparent 60%), linear-gradient(180deg, #070a10, #05070b 40%); }
+.topbar { background: rgba(5,7,11,.86); border-bottom: 1px solid rgba(255,255,255,.08); }
+.brand .puck { background: #fff; color: #000; box-shadow: 0 0 0 2px #0b0f16, 0 0 0 3px rgba(255,255,255,.4); }
+.nav a.on { background: #fff; color: #05070b; }
+.btn.primary { background: var(--brand); box-shadow: 0 8px 24px rgba(47,123,255,.35); }
+.seg button.on { background: #fff; color: #05070b; }
+.card { background: linear-gradient(180deg, rgba(20,27,38,.9), rgba(12,16,23,.9)); box-shadow: 0 14px 40px rgba(0,0,0,.45); }
+.wbar .h { background: linear-gradient(90deg, #2f7bff, var(--home)); }
+.wbar .a { background: linear-gradient(90deg, #c9d3e0, #ffffff); }
+.wlab .a { color: #e8edf4; }
+.sechead .no { color: var(--cyan); font-size: 18px; letter-spacing: .1em; }
+.sechead h2 { color: #fff; position: relative; padding-bottom: 6px; }
+.sechead h2::after { content: ""; position: absolute; left: 0; bottom: -4px; width: 64px; height: 5px; background: var(--red); transform: skewX(-20deg); }
+.pill.hot { background: rgba(255,45,61,.16); color: #ff6b77; }
+.odd { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.25); color: #fff; }
+.helpbox { background: rgba(76,195,255,.06); border-color: rgba(76,195,255,.22); }
+table.t th { background: rgba(14,19,27,.98); color: #c9d4e3; text-transform: uppercase; letter-spacing: .04em; font-size: 11.5px; }
+td.gold, .gold { color: #fff !important; }
+.pbar { background: linear-gradient(90deg, #2f7bff, #4cc3ff); }
+#chatbtn { background: var(--brand); box-shadow: 0 10px 30px rgba(47,123,255,.45); }
+#slipbtn { background: #fff; color: #05070b; box-shadow: 0 10px 30px rgba(255,255,255,.18); }
+#slipbtn .cnt { background: var(--red); color: #fff; }
+#chat { background: #0b0f16; } #chat header { background: linear-gradient(135deg, rgba(47,123,255,.22), rgba(255,255,255,.05)); }
+.msg.user { background: var(--brand); }
+#progress { background: linear-gradient(90deg, #2f7bff, #4cc3ff, #fff); }
+.marquee { background: #fff; border-color: #fff; } .marquee span { color: #05070b; } .marquee span em { color: var(--red); }
+.counters b { color: #fff; }
+.mcard .wmL, .mcard .wmR { opacity: .06; }
+.res.V { background: rgba(53,211,154,.18); } .res.P { background: rgba(255,45,61,.18); color: #ff6b77; }
+.scoreboard .digits { color: #ff2d3d; text-shadow: 0 0 18px rgba(255,45,61,.6); }
+/* ikony */
+.ic { display: inline-block; width: 1.05em; height: 1.05em; vertical-align: -0.16em; flex: none; }
+.ic svg { width: 100%; height: 100%; display: block; }
+/* ---------- hero: aréna ---------- */
+.hero2 { background: none !important; padding-top: 80px; }
+.hero2 .sky { position: absolute; inset: 0; background:
+    radial-gradient(60% 40% at 50% 0%, rgba(255,255,255,.18), transparent 70%),
+    radial-gradient(1px 1px at 20% 30%, rgba(255,255,255,.5), transparent), 
+    linear-gradient(180deg, #0a0e15 0%, #0d131d 45%, #111a27 62%, #05070b 100%); }
+.hero2 .sky::before { content: ""; position: absolute; inset: 0 0 38% 0; opacity: .55;
+  background-image: radial-gradient(circle, rgba(255,255,255,.35) 0 1px, transparent 1.5px), radial-gradient(circle, rgba(76,195,255,.25) 0 1px, transparent 1.5px);
+  background-size: 14px 12px, 23px 19px; background-position: 0 0, 7px 5px; -webkit-mask: linear-gradient(180deg, transparent, #000 35%, #000 80%, transparent); mask: linear-gradient(180deg, transparent, #000 35%, #000 80%, transparent); }
+.hero2 .sun { position: absolute; inset: 0; pointer-events: none; border-radius: 0; width: auto; transform: none; animation: none; filter: none; -webkit-mask: none; mask: none;
+  background: conic-gradient(from 180deg at 18% -10%, transparent 0 8deg, rgba(255,255,255,.12) 10deg 14deg, transparent 16deg),
+              conic-gradient(from 180deg at 50% -12%, transparent 0 172deg, rgba(255,255,255,.10) 176deg 184deg, transparent 188deg),
+              conic-gradient(from 180deg at 82% -10%, transparent 0 344deg, rgba(255,255,255,.12) 346deg 350deg, transparent 352deg);
+  animation: beams 7s ease-in-out infinite alternate; }
+@keyframes beams { from { opacity: .55; } to { opacity: 1; } }
+.hero2 .skyline { position: absolute; left: 0; right: 0; top: 60%; height: 10%; width: 100%; }
+.hero2 .stage3d { top: 66%; perspective: 900px; }
+.hero2 #icecv { inset: 0 -10%; width: 120%; height: 100%; transform: rotateX(50deg); transform-origin: 50% 0%; }
+.hero2 #frost { display: none; }
+.hero2 .backword { display: block; top: 38%; -webkit-text-stroke: 2px rgba(255,255,255,.06); }
+.hero2 h1 { font-size: clamp(60px, 10.5vw, 165px) !important; line-height: 1.08 !important; text-shadow: none !important; }
+.hero2 h1 .ln { padding-top: .2em !important; margin-top: -.2em !important; }
+.hero2 h1 .ln > i { background: linear-gradient(180deg, #ffffff 0%, #eef3f9 50%, #a9b8cc 100%); -webkit-background-clip: text; background-clip: text; color: transparent;
+  -webkit-text-stroke: 0; filter: drop-shadow(0 6px 0 rgba(0,0,0,.55)); }
+.hero2 h1 .ln:nth-child(2) > i { background: linear-gradient(180deg, #bfe9ff, #4cc3ff); -webkit-background-clip: text; background-clip: text; color: transparent; -webkit-text-stroke: 0; }
+.hero2 .lead { color: #dfe7f1 !important; text-shadow: 0 2px 12px rgba(0,0,0,.6); }
+.hero2 .counters { border-top-color: rgba(255,255,255,.22); }
+.hero2 .help, .hero2 .hint2 { color: #c9d4e3 !important; }
+.badge-gta { display: inline-flex; align-items: center; gap: 10px; padding: 0; border-radius: 0; background: none; border: none;
+  font-family: Anton, Impact, sans-serif; letter-spacing: .1em; font-size: 16px; text-transform: uppercase; position: relative; z-index: 3; color: #fff; }
+.hero2 .counters { background: rgba(5,7,11,.86); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,.12) !important; border-radius: 16px; padding: 4px 18px 14px; margin-top: 34px; }
+.hero2 .counters div + div { border-left-color: rgba(255,255,255,.12); }
+.hero2 > .help, .hero2 .hint2 { display: inline-block; background: rgba(5,7,11,.82); padding: 5px 12px; border-radius: 8px; margin-right: auto; }
+.hero2 .daytabs { background: rgba(5,7,11,.86) !important; }
+.hero2 .skyline { z-index: 1; }
+.badge-gta::before { content: ""; width: 34px; height: 6px; background: var(--red); transform: skewX(-20deg); }
+/* ---------- NHL ID karta ---------- */
+.idwrap { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 26px; align-items: start; margin-top: 18px; }
+.idctl .row { margin-bottom: 14px; } .idctl label { display: block; font-size: 12px; font-weight: 800; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 6px; }
+.idctl select, .idctl input { width: 100%; }
+.themes { display: flex; gap: 8px; } .themes button { flex: 1; height: 42px; border-radius: 10px; border: 2px solid transparent; cursor: pointer; }
+.themes button.on { border-color: #fff; }
+.idstage { perspective: 1600px; display: flex; justify-content: center; padding: 20px 0 40px; }
+.idcard { width: min(100%, 640px); aspect-ratio: 1.586; position: relative; transform-style: preserve-3d; transition: transform .9s cubic-bezier(.2,.8,.2,1); cursor: pointer; }
+.idcard.flip { transform: rotateY(180deg); }
+.idface { position: absolute; inset: 0; border-radius: 22px; overflow: hidden; backface-visibility: hidden; -webkit-backface-visibility: hidden;
+  box-shadow: 0 30px 70px rgba(0,0,0,.55), inset 0 0 0 1px rgba(255,255,255,.25); color: #241031; }
+.idface.back { transform: rotateY(180deg); }
+.idface .bg { position: absolute; inset: 0; background: var(--cardbg); }
+.idface .holo { position: absolute; inset: 0; mix-blend-mode: color-dodge; opacity: .35; pointer-events: none;
+  background: linear-gradient(115deg, transparent 20%, rgba(180,200,230,.6) 35%, rgba(255,255,255,.75) 45%, rgba(150,210,255,.6) 55%, transparent 70%);
+  background-size: 250% 250%; background-position: var(--hx, 50%) var(--hy, 50%); transition: background-position .1s; }
+.idface .hdr { position: absolute; left: 0; right: 0; top: 0; height: 17%; display: flex; align-items: center; justify-content: space-between; padding: 0 5%;
+  background: linear-gradient(100deg, #05070b 0 62%, var(--tc) 62% 78%, #ffffff 78% 80%, var(--tc) 80%); color: #fff; }
+.idface .hdr b { font-family: Anton, Impact, sans-serif; font-size: clamp(18px, 3.4vw, 30px); letter-spacing: .06em; text-shadow: 2px 2px 0 rgba(0,0,0,.25); }
+.idface .hdr span { font-family: Anton, Impact, sans-serif; font-size: clamp(11px, 1.7vw, 15px); letter-spacing: .12em; opacity: .9; }
+.idface .photo { position: absolute; left: 5%; top: 23%; width: 28%; height: 62%; border-radius: 14px; overflow: hidden;
+  background: linear-gradient(160deg, var(--tc), #12081f); display: grid; place-items: center; box-shadow: inset 0 0 0 3px rgba(255,255,255,.6); }
+.idface .photo .num { font-family: Anton, Impact, sans-serif; font-size: clamp(60px, 12vw, 120px); color: #fff; line-height: 1; text-shadow: 4px 4px 0 rgba(0,0,0,.3); }
+.idface .photo img { position: absolute; width: 44%; right: 6%; bottom: 6%; opacity: .95; filter: drop-shadow(0 3px 6px rgba(0,0,0,.4)); }
+.idface .fields { position: absolute; left: 38%; right: 5%; top: 22%; display: grid; grid-template-columns: 1fr 1fr; gap: 3.2% 6%; font-family: "JetBrains Mono", monospace; }
+.idface .fields div small { display: block; font-size: clamp(8px, 1.15vw, 11px); font-weight: 700; color: #6b7a90; letter-spacing: .1em; }
+.idface .fields div b { font-size: clamp(11px, 1.9vw, 18px); color: #1d0b2a; text-transform: uppercase; }
+.idface .fields .wide { grid-column: 1 / -1; }
+.idface .fields .wide b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: clamp(20px, 4vw, 38px); letter-spacing: .02em; }
+.idface .sig { position: absolute; left: 38%; bottom: 7%; font-family: Caveat, cursive; font-size: clamp(20px, 3.6vw, 34px); color: #0d2a6e; transform: rotate(-4deg); }
+.idface::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3.5%; background: linear-gradient(90deg, var(--tc) 0 70%, #fff 70% 72%, #05070b 72%); }
+.idface .bar { position: absolute; right: 5%; bottom: 7%; width: 26%; height: 11%; }
+.idface .stamp { position: absolute; right: 7%; top: 21%; width: 17%; aspect-ratio: 1; opacity: .9; }
+.idface .bstats { position: absolute; inset: 21% 5% 6% 5%; display: grid; grid-template-columns: repeat(4, 1fr); grid-auto-rows: min-content; gap: 10px; font-family: "JetBrains Mono", monospace; }
+.idface .bstats div { background: rgba(255,255,255,.55); border-radius: 10px; padding: 8px 10px; }
+.idface .bstats small { display: block; font-size: clamp(8px, 1.1vw, 11px); color: #6b7a90; font-weight: 700; letter-spacing: .08em; }
+.idface .bstats b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: clamp(18px, 3vw, 30px); color: #1d0b2a; }
+.idface .bstats .spark { grid-column: 1 / -1; background: rgba(29,11,42,.85); color: #fff; }
+.idface .bstats .spark small { color: #9fd3ff; }
+.idnote { text-align: center; color: var(--muted); font-size: 13px; margin-top: -18px; }
+/* ---------- modal hráče ---------- */
+#pmodal { position: fixed; inset: 0; z-index: 120; background: rgba(8,3,16,.72); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 16px; }
+#pmodal .box { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow-y: auto; background: linear-gradient(180deg, #24123c, #160b26); border: 1px solid var(--line2);
+  border-radius: 22px; padding: 22px; box-shadow: 0 30px 80px rgba(0,0,0,.6); animation: pop .4s cubic-bezier(.2,1.2,.4,1) both; }
+#pmodal .x { float: right; background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; }
+.pname-link { cursor: pointer; border-bottom: 1px dashed rgba(255,255,255,.3); }
+.pname-link:hover { color: var(--gold); border-color: var(--gold); }
+.injbadge { display: inline-flex; gap: 4px; align-items: center; font-size: 11px; font-weight: 800; padding: 2px 7px; border-radius: 6px; background: rgba(255,84,112,.16); color: var(--red); }
+.injbadge.dtd { background: rgba(255,194,75,.14); color: var(--gold); }
+.goalrow { display: grid; grid-template-columns: 56px 1fr auto; gap: 10px; align-items: start; padding: 12px 0; border-bottom: 1px dashed var(--line); }
+.goalrow .t { font-family: Anton, Impact, sans-serif; font-size: 20px; color: var(--gold); }
+.goalrow .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.airesp { grid-column: 1 / -1; background: rgba(45,226,230,.07); border: 1px solid rgba(45,226,230,.25); border-radius: 12px; padding: 10px 12px; font-size: 14px; line-height: 1.55; }
+.books td.best { color: var(--green); font-weight: 900; }
+.retro { background: linear-gradient(90deg, rgba(255,122,69,.18), rgba(255,61,154,.18)); border: 1px solid rgba(255,122,69,.35); border-radius: 14px; padding: 12px 16px; margin-top: 14px; }
+@media (max-width: 900px) { .idwrap { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .nav { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; } .nav a { flex: 0 0 auto !important; padding: 8px 12px; } }
+@media (max-width: 720px) { .goalrow { grid-template-columns: 48px 1fr; } .goalrow .acts { grid-column: 1 / -1; justify-content: flex-start; } }
+@media (max-width: 720px) { .hero2 { padding-top: 50px; } .hero2 .sun { top: 30%; width: 80vw; } .idface .bstats { grid-template-columns: repeat(3, 1fr); gap: 6px; } }
 </style>
 </head>
 <body>
 <div id="progress"></div>
 <div id="cur"></div>
+<div id="pmodal" class="hidden"><div class="box" id="pmbox"></div></div>
 <div class="topbar"><div class="wrap">
   <a class="brand" href="#"><span class="puck">🏒</span><span>NHL Predikce<small>body · střely · vyloučení · kurzy</small></span></a>
   <nav class="nav">
     <a href="#" id="nav-over" class="on">🔮 Předpovědi</a>
     <a href="#live" id="nav-live"><span class="livedot"></span> Live</a>
     <a href="#presnost" id="nav-acc">🎯 Přesnost</a>
+    <a href="#karta" id="nav-card">🪪 NHL ID</a>
     <a href="#statistiky" id="nav-stats">📊 Statistiky</a>
   </nav>
 </div></div>
@@ -1895,6 +2339,7 @@ td.gold { color: var(--gold); font-weight: 800; }
   <section id="view-game" class="hidden"></section>
   <section id="view-live" class="hidden"></section>
   <section id="view-acc" class="hidden"></section>
+  <section id="view-card" class="hidden"></section>
   <section id="view-stats" class="hidden">
     <div class="thead" style="margin-top:26px"><img id="slogo" alt=""><div><h1 class="page" id="stitle" style="margin:0">Statistiky týmu</h1><div class="sub" id="ssub"></div></div></div>
     <div class="controls">
@@ -1991,7 +2436,7 @@ function playerCard(p, logo, extra = "") {
     <div class="jn">${p.num ?? ""}</div><img class="wm" src="${esc(logo)}" alt="">
     ${p.streak >= 3 ? `<span class="pill hot streak">🔥 ${p.streak} v řadě</span>` : ""}
     <div class="top"><img src="${esc(logo)}" alt=""><small>${esc(p.team)} · ${posName[p.pos] || p.pos}${p.num != null ? " · #" + p.num : ""}</small></div>
-    <div class="pname"><span>${esc(first)}</span>${esc(last)}</div>
+    <div class="pname"><span>${esc(first)}</span><span class="pname-link" data-player="${p.id}:${p.team}" style="font-size:inherit;color:inherit;display:inline">${esc(last)}</span></div>
     <div class="big">${pc(p.pPoint)}<small>šance na kanadský bod</small></div>
     <div class="pst"><div><b>${pc(p.pGoal)}</b><small>šance na gól</small></div><div><b>${num(p.expShots, 1)}</b><small>oček. střely</small></div>
       <div><b><span class="dots">${dots}</span></b><small>posl. 5 zápasů</small></div></div>
@@ -2055,7 +2500,9 @@ window.addEventListener("scroll", () => {
       const bw = document.getElementById("backword");
       if (bw) bw.style.transform = `translate(-50%, -50%) scale(${1 + y / 500})`, (bw.style.opacity = 1 - y / 600);
       const cv = document.getElementById("icecv");
-      if (cv) cv.style.transform = `rotateX(${Math.min(55, y / 10)}deg) translateY(${y * 0.15}px)`;
+      if (cv) cv.style.transform = `rotateX(${Math.min(75, 52 + y / 25)}deg)`;
+      const sun = cine.querySelector(".sun");
+      if (sun) sun.style.transform = `translate(-50%, ${-50 + y / 8}%)`;
     } else {
       h1.style.transform = `translateY(${y * 0.35}px)`;
       h1.style.opacity = 1 - y / 700;
@@ -2149,11 +2596,11 @@ function initHero2() {
     const hc = "#0ea5e9";
     ctx.clearRect(0, 0, W, H);
     const g = ctx.createRadialGradient(W * 0.6, H * 0.4, 10, W * 0.5, H * 0.5, Math.max(W, H) * 0.8);
-    g.addColorStop(0, "#16345e"); g.addColorStop(0.5, "#0b1a33"); g.addColorStop(1, "#060a14"); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    g.addColorStop(0, "#f7fbff"); g.addColorStop(0.6, "#dfeaf6"); g.addColorStop(1, "#b9c9dc"); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
     // rink lines
     const rx = W * 0.06, ry = H * 0.12, rw = W * 0.88, rh = H * 0.76, rr = rh * 0.32;
-    ctx.save(); ctx.globalAlpha = 0.55; ctx.lineWidth = 3;
-    ctx.strokeStyle = "rgba(207,230,255,.55)"; ctx.beginPath(); ctx.roundRect(rx, ry, rw, rh, rr); ctx.stroke();
+    ctx.save(); ctx.globalAlpha = 0.9; ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(150,170,195,.6)"; ctx.beginPath(); ctx.roundRect(rx, ry, rw, rh, rr); ctx.stroke();
     ctx.strokeStyle = "rgba(255,77,94,.7)"; ctx.lineWidth = 6; ctx.beginPath(); ctx.moveTo(W / 2, ry); ctx.lineTo(W / 2, ry + rh); ctx.stroke();
     ctx.strokeStyle = "rgba(77,163,255,.75)"; ctx.lineWidth = 7;
     [0.36, 0.64].forEach((k) => { ctx.beginPath(); ctx.moveTo(rx + rw * k, ry); ctx.lineTo(rx + rw * k, ry + rh); ctx.stroke(); });
@@ -2163,20 +2610,20 @@ function initHero2() {
     ctx.restore();
     // pulzující světla stadionu
     for (let i = 0; i < 5; i++) {
-      const lx = W * (0.1 + i * 0.2), a = 0.05 + 0.04 * Math.sin(t / 900 + i);
-      const lg = ctx.createRadialGradient(lx, -40, 0, lx, -40, H * 0.9); lg.addColorStop(0, `rgba(160,210,255,${a})`); lg.addColorStop(1, "rgba(160,210,255,0)");
+      const lx = W * (0.1 + i * 0.2), a = 0.10 + 0.06 * Math.sin(t / 900 + i);
+      const lg = ctx.createRadialGradient(lx, H * 0.2, 0, lx, H * 0.2, H * 0.8); lg.addColorStop(0, `rgba(255,255,255,${a})`); lg.addColorStop(1, "rgba(255,255,255,0)");
       ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
     }
     ctx.drawImage(trail, 0, 0, W, H);
     // sníh / ledová tříšť ve vzduchu
-    ctx.fillStyle = "rgba(255,255,255,.55)";
+    ctx.fillStyle = "rgba(120,150,190,.35)";
     snow.forEach((p) => { p.y -= p.v; p.x += Math.sin((t / 1000) + p.r) * 0.2; if (p.y < -5) { p.y = H + 5; p.x = Math.random() * W; } ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); });
     // částice
     for (let i = parts.length - 1; i >= 0; i--) { const p = parts[i]; p.x += p.vx; p.y += p.vy; p.vx *= 0.94; p.vy *= 0.94; p.life -= 0.025;
-      if (p.life <= 0) { parts.splice(i, 1); continue; } ctx.fillStyle = `rgba(220,240,255,${p.life})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); }
+      if (p.life <= 0) { parts.splice(i, 1); continue; } ctx.fillStyle = `rgba(160,185,215,${p.life})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill(); }
     // puk
     const sp = Math.hypot(puck.vx, puck.vy);
-    if (sp > 6) { ctx.strokeStyle = "rgba(56,189,248,.35)"; ctx.lineWidth = 10; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(puck.x, puck.y); ctx.lineTo(puck.x - puck.vx * 4, puck.y - puck.vy * 4); ctx.stroke(); }
+    if (sp > 6) { ctx.strokeStyle = "rgba(47,123,255,.35)"; ctx.lineWidth = 10; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(puck.x, puck.y); ctx.lineTo(puck.x - puck.vx * 4, puck.y - puck.vy * 4); ctx.stroke(); }
     ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.beginPath(); ctx.ellipse(puck.x + 4, puck.y + 9, 22, 9, 0, 0, 6.29); ctx.fill();
     ctx.fillStyle = "#0b0f17"; ctx.beginPath(); ctx.ellipse(puck.x, puck.y + 5, 20, 9, 0, 0, 6.29); ctx.fill(); ctx.fillRect(puck.x - 20, puck.y - 1, 40, 6);
     const pg = ctx.createLinearGradient(puck.x - 20, puck.y - 9, puck.x + 20, puck.y + 9); pg.addColorStop(0, "#3a4250"); pg.addColorStop(1, "#111722");
@@ -2194,13 +2641,14 @@ function initHero2() {
     if (puck.y < m || puck.y > H - m) { puck.vy *= -0.8; puck.y = Math.max(m, Math.min(H - m, puck.y)); burst(puck.x, puck.y, 10); }
     // stopa bruslí
     tx.globalCompositeOperation = "destination-out"; tx.fillStyle = "rgba(0,0,0,.012)"; tx.fillRect(0, 0, W, H);
-    tx.globalCompositeOperation = "source-over"; tx.strokeStyle = "rgba(210,235,255,.22)"; tx.lineWidth = 2; tx.lineCap = "round";
+    tx.globalCompositeOperation = "source-over"; tx.strokeStyle = "rgba(120,145,175,.28)"; tx.lineWidth = 2; tx.lineCap = "round";
     const nx = -(puck.y - py), ny = puck.x - px, nl = Math.hypot(nx, ny) || 1;
     [-7, 7].forEach((o) => { tx.beginPath(); tx.moveTo(px + (nx / nl) * o, py + (ny / nl) * o); tx.lineTo(puck.x + (nx / nl) * o, puck.y + (ny / nl) * o); tx.stroke(); });
     if (Math.hypot(puck.vx, puck.vy) > 9 && Math.random() < 0.5) burst(puck.x, puck.y, 2);
   }
   function burst(x, y, n) { for (let i = 0; i < n; i++) { const a = Math.random() * 6.28, v = Math.random() * 5 + 1; parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: Math.random() * 2.2 + 0.6, life: 1 }); } }
   function melt() {
+    if (getComputedStyle(fr).display === "none") return;
     // námraza pomalu znovu narůstá
     if ((melt.n = (melt.n || 0) + 1) % 5 === 0) { fx.globalCompositeOperation = "source-over"; fx.globalAlpha = 0.05; fx.drawImage(frostTex, 0, 0, FW, FH); fx.globalAlpha = 1; }
     if (!mouse.active) return;
@@ -2247,7 +2695,8 @@ function initHero2() {
       mag.style.transform = `translate(${(e.clientX - r.left - r.width / 2) * 0.25}px, ${(e.clientY - r.top - r.height / 2) * 0.35}px)`; }
   });
   addEventListener("mouseout", (e) => { if (!e.relatedTarget) c.classList.remove("on"); });
-  (function f() { cx += (x - cx) * 0.22; cy += (y - cy) * 0.22; c.style.transform = `translate(${cx}px, ${cy}px)`; requestAnimationFrame(f); })();
+  const z = () => parseFloat(getComputedStyle(document.body).zoom) || 1;
+  (function f() { cx += (x - cx) * 0.22; cy += (y - cy) * 0.22; const k = z(); c.style.transform = `translate(${cx / k}px, ${cy / k}px)`; requestAnimationFrame(f); })();
 })();
 
 let revealObs = null;
@@ -2260,7 +2709,77 @@ function reveal(root) {
   els.forEach((e, i) => { e.style.transitionDelay = `${Math.min(i % 8, 7) * 60}ms`; revealObs.observe(e); });
 }
 
-// sortovatelná tabulka – formátovač dostává (hodnota, řádek)
+// ---------- ikony (SVG místo emoji) ----------
+const ICP = {
+  spark: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 3v4M17 5h4"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/>',
+  bars: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  bot: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9 17h6"/>',
+  ticket: '<path d="M3 8a2 2 0 0 0 0 4v4h18v-4a2 2 0 0 1 0-4V4H3z" transform="translate(0 2)"/><path d="M14 6v12" stroke-dasharray="2 2"/>',
+  stick: '<path d="M14 3l-6 15a2 2 0 0 0 2 2h6"/><ellipse cx="19" cy="19" rx="3" ry="1.5"/>',
+  whistle: '<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>',
+  goal: '<path d="M3 20V7h18v13"/><path d="M3 7l4 4h10l4-4M7 11v9M17 11v9M7 15h10"/>',
+  glove: '<path d="M7 11V5a2 2 0 0 1 4 0v5M11 9V4a2 2 0 0 1 4 0v6M15 9V6a2 2 0 0 1 4 0v8a7 7 0 0 1-7 7h-1a7 7 0 0 1-6-3l-2-4a2 2 0 0 1 3-2l2 2"/>',
+  coins: '<ellipse cx="9" cy="7" rx="6" ry="3"/><path d="M3 7v5c0 1.7 2.7 3 6 3s6-1.3 6-3V7"/><path d="M15 11c3.3 0 6 1.3 6 3v4c0 1.7-2.7 3-6 3s-6-1.3-6-3"/>',
+  calc: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8 12h.01M12 12h.01M16 12h.01M8 16h.01M12 16h.01M16 16h.01"/>',
+  brain: '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V4a3 3 0 0 0-3 0zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1"/>',
+  swords: '<path d="M14.5 17.5L3 6V3h3l11.5 11.5M13 19l6-6M16 16l4 4M9.5 6.5L13 3h3v3l-3.5 3.5M5 14l-2 2 3 3 2-2"/>',
+  chart: '<path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 6-6"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  trophy: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M17 5h3v2a4 4 0 0 1-4 4M7 5H4v2a4 4 0 0 0 4 4"/>',
+  book: '<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2zM4 19V5"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/>',
+  flame: '<path d="M12 3c1 4 5 5 5 10a5 5 0 0 1-10 0c0-3 2-4 2-6 2 1 3 3 3 3s1-3 0-7z"/>',
+  siren: '<path d="M6 18v-6a6 6 0 0 1 12 0v6M4 21h16M12 3v2M4.2 7.2l1.4 1.4M19.8 7.2l-1.4 1.4"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  hit: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  arrow: '<path d="M7 17L17 7M9 7h8v8"/>',
+  dot: '<circle cx="12" cy="12" r="4"/>',
+  feed: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  phone: '<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>',
+  star: '<path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2-5.5-2.9-5.5 2.9 1-6.2L3 9.6l6.2-.9z"/>',
+  bolt: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+  id: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2.5"/><path d="M5.5 16c.6-1.6 2-2.5 3.5-2.5s2.9.9 3.5 2.5M14 9h4M14 12h4M14 15h2"/>',
+  wave: '<path d="M7 11V6a1.5 1.5 0 0 1 3 0v5M10 10V4.5a1.5 1.5 0 0 1 3 0V10M13 10V5.5a1.5 1.5 0 0 1 3 0V12M16 11a1.5 1.5 0 0 1 3 0v3a7 7 0 0 1-12.6 4.2L4 14.8a1.5 1.5 0 0 1 2.4-1.8L7 14"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  play: '<path d="M7 4l13 8-13 8z"/>',
+  medic: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 7v10M7 12h10"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14"/>',
+  check: '<path d="M5 12l5 5 9-10"/>', cross: '<path d="M6 6l12 12M18 6L6 18"/>',
+};
+const ic = (n, cls = "") => `<span class="ic ${cls}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICP[n] || ICP.dot}</svg></span>`;
+const EMOJI = { "🔮": "spark", "🎯": "target", "📊": "bars", "🤖": "bot", "🎫": "ticket", "🏒": "stick", "⛔": "whistle", "🥅": "goal", "🧤": "glove",
+  "💰": "coins", "🧮": "calc", "🧠": "brain", "⚔️": "swords", "📈": "chart", "📅": "calendar", "🏆": "trophy", "📖": "book", "👋": "wave", "👀": "eye",
+  "🔥": "flame", "🚨": "siren", "🕒": "clock", "💥": "hit", "🛡️": "shield", "↗️": "arrow", "⚪": "dot", "⚡": "bolt", "📰": "feed", "📱": "phone",
+  "⭐": "star", "🪪": "id", "🗑": "trash", "🧊": "dot", "🔲": "dot", "🫳": "dot", "❌": "cross", "✅": "check", "⏹": "dot", "⏳": "clock", "🩹": "medic" };
+const EMOJI_RE = new RegExp(Object.keys(EMOJI).map((e) => e.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g");
+function iconify(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: (n) => (EMOJI_RE.test(n.nodeValue) ? (EMOJI_RE.lastIndex = 0, 1) : 2) });
+  const nodes = []; let n; while ((n = walker.nextNode())) nodes.push(n);
+  nodes.forEach((t) => {
+    if (t.parentNode.closest && t.parentNode.closest("svg, option, select, title, textarea, input")) return;
+    const span = document.createElement("span");
+    span.innerHTML = esc(t.nodeValue).replace(EMOJI_RE, (m) => {
+      const cls = m === "✅" ? "okc" : m === "❌" ? "noc" : m === "🔥" ? "fl" : "";
+      return ic(EMOJI[m], cls);
+    });
+    t.replaceWith(...span.childNodes);
+  });
+}
+new MutationObserver((ms) => { for (const m of ms) m.addedNodes.forEach((n) => { if (n.nodeType === 1) iconify(n); else if (n.nodeType === 3 && n.parentNode) iconify(n.parentNode); }); })
+  .observe(document.body, { childList: true, subtree: true });
+document.addEventListener("DOMContentLoaded", () => iconify(document.body));
+
+const SKYLINE = `<svg class="skyline" viewBox="0 0 1200 120" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+  <defs><linearGradient id="glass" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#bfe3ff" stop-opacity=".10"/><stop offset="1" stop-color="#bfe3ff" stop-opacity=".02"/></linearGradient></defs>
+  <rect x="0" y="0" width="1200" height="78" fill="url(#glass)"/>
+  ${Array.from({ length: 13 }, (_, i) => `<line x1="${i * 100}" y1="0" x2="${i * 100}" y2="78" stroke="rgba(255,255,255,.18)" stroke-width="2"/>`).join("")}
+  <rect x="0" y="78" width="1200" height="34" fill="#f4f7fb"/>
+  <rect x="0" y="108" width="1200" height="12" fill="#ffd200"/>
+  ${Array.from({ length: 8 }, (_, i) => `<rect x="${i * 150 + 20}" y="84" width="110" height="20" rx="2" fill="${["#0d47c9", "#05070b", "#d6001c", "#0d47c9", "#05070b", "#d6001c", "#0d47c9", "#05070b"][i]}" opacity=".85"/><text x="${i * 150 + 75}" y="99" font-family="Anton" font-size="13" fill="#fff" text-anchor="middle" letter-spacing="2">${["NHL", "PREDIKCE", "LIVE", "ICE", "NHL", "STATS", "LIVE", "ICE"][i]}</text>`).join("")}
+</svg>`;
+
 function sortTable(el, cols, rows, sort, onSort, rowClass) {
   const sc = cols.find((c) => c.k === sort.key) || cols[1];
   const val = (c, p) => (c.v ? c.v(p) : p[c.k]);
@@ -2328,7 +2847,10 @@ function route() {
   const stats = h === "#statistiky";
   const live = h === "#live" || h.startsWith("#live-");
   const acc = h === "#presnost";
-  const over = !game && !stats && !live && !acc;
+  const card = h.startsWith("#karta");
+  const over = !game && !stats && !live && !acc && !card;
+  $("view-card").classList.toggle("hidden", !card);
+  $("nav-card").classList.toggle("on", card);
   $("view-over").classList.toggle("hidden", !over);
   $("view-game").classList.toggle("hidden", !game);
   $("view-stats").classList.toggle("hidden", !stats);
@@ -2346,6 +2868,7 @@ function route() {
   else if (game) openGame(game);
   else if (live) openLive(h.startsWith("#live-") ? +h.slice(6) : null);
   else if (acc) loadAcc();
+  else if (card) openCard(h.slice(7));
   else loadOverview();
   window.scrollTo(0, 0);
 }
@@ -2389,7 +2912,7 @@ function renderOverview() {
   const byShots = [...all].sort((a, b) => b.expShots - a.expShots).slice(0, 10);
   const logo = (g, t) => (t === g.home ? g.homeLogo : g.awayLogo);
   const lrow = (p, i, val) => `<div class="lrow" data-go="${p.g.id}"><span class="rk">${i + 1}</span><img src="${esc(logo(p.g, p.team))}" alt="">
-      <span class="nm">${esc(p.name)}${p.streak >= 3 ? ` <span class="pill hot">🔥${p.streak}</span>` : ""}<small>${esc(p.g.home)} – ${esc(p.g.away)} · ${fmtTime(p.g.start)}</small></span><span class="val">${val}</span></div>`;
+      <span class="nm"><span class="pname-link" data-player="${p.id}:${p.team}">${esc(p.name)}</span>${p.streak >= 3 ? ` <span class="pill hot">🔥${p.streak}</span>` : ""}<small>${esc(p.g.home)} – ${esc(p.g.away)} · ${fmtTime(p.g.start)}</small></span><span class="val">${val}</span></div>`;
   const valueBadge = (g) => {
     const v = g.value || {};
     const best = Object.entries(v).sort((a, b) => b[1] - a[1])[0];
@@ -2403,9 +2926,10 @@ function renderOverview() {
   const cards = [...all].sort((a, b) => b.pPoint - a.pPoint).filter((p) => !seen.has(p.id) && seen.add(p.id)).slice(0, 8);
   el.innerHTML = `
     <section class="cine hero2" id="cine">
+      <div class="sky"></div><div class="sun"></div>${SKYLINE}
       <div class="stage3d"><canvas id="icecv"></canvas></div><canvas id="frost"></canvas>
       <div class="backword" id="backword">NHL</div>
-      <div class="kicker">NHL · předpovědi · ${dayIso ? fmtDay(dayIso) : ""}</div>
+      <div><span class="badge-gta">NHL · Předpovědi · ${dayIso ? fmtDay(dayIso) : ""}</span></div>
       <h1 class="display"><span class="ln"><i>Hokejová noc</i></span><span class="ln"><i>v číslech</i></span></h1>
       <p class="lead">Model prošel ${(OV.status?.total || 0)} odehraných zápasů sezóny a spočítal, kdo dá bod, kolik padne střel, gólů a vyloučení
         ${best ? `– největší šanci na bod má dnes <b style="color:#fff">${esc(best.name)}</b> (${pc(best.pPoint)}).` : "."}</p>
@@ -2431,6 +2955,7 @@ function renderOverview() {
         <li><b>🎫 Vlevo dole je tvůj tiket</b> – v detailu zápasu přidáváš sázky tlačítkem „+ tiket“ a stránka spočítá celkový kurz a šanci.</li>
         <li>V detailu zápasu najdeš i <b>simulaci zápasu</b>, <b>hřiště se střelami</b> a <b>porovnání hráčů</b>.</li>
         <li><b>🔴 Live</b> nahoře = zápasy, které se právě hrají, na 3D hřišti s pukem. <b>🎯 Přesnost</b> = jak se modelu dařilo v odehraných zápasech.</li>
+        <li><b>🪪 NHL ID</b> nahoře = vytvoř si „občanku“ libovolného hráče ve stylu GTA. Na jméno hráče můžeš kdekoli kliknout a otevře se jeho <b>analýza</b>.</li>
         <li><b>📱 Na mobilu</b> si web můžeš dát na plochu jako aplikaci: v iPhonu Safari → tlačítko Sdílet → <b>Přidat na plochu</b>; v Androidu Chrome → menu ⋮ → <b>Přidat na plochu / Nainstalovat aplikaci</b>.</li>
       </ul></div></div>
     <div class="sechead"><span class="no">01</span><h2>Hráči dne</h2><span class="hint">největší šance na kanadský bod</span></div>
@@ -2575,7 +3100,7 @@ function renderMarkets() {
 }
 const PL_COLS = [
   { k: "_rank", t: "#", cls: "rank", nosort: true },
-  { k: "name", t: "Hráč", cls: "left", f: (v, p) => `<b>${esc(v)}</b>${p.streak >= 3 ? ` <span class="pill hot">🔥 ${p.streak} v řadě</span>` : ""}${!p.active ? ` <span class="pill bad">nehrál ${p.lastGameAgo} z.</span>` : ""}` },
+  { k: "name", t: "Hráč", cls: "left", f: (v, p) => `<b class="pname-link" data-player="${p.id}:${p.team}">${esc(v)}</b>${p.streak >= 3 ? ` <span class="pill hot">🔥 ${p.streak} v řadě</span>` : ""}${p.injury ? ` <span class="injbadge ${p.injury.out ? "" : "dtd"}" title="${esc(p.injury.comment)}">🩹 ${esc(p.injury.status)}</span>` : !p.active ? ` <span class="pill bad">nehrál ${p.lastGameAgo} z.</span>` : ""}` },
   { k: "team", t: "Tým", cls: "left pos" },
   { k: "pos", t: "Poz", cls: "left pos", f: (v) => posName[v] || v },
   { k: "pPoint", t: "Šance na bod", cls: "gold", f: (v) => `<span class="pbar" style="width:${Math.round(v * 60)}px"></span>${pc(v)}` },
@@ -2671,6 +3196,8 @@ function renderGame() {
         <a class="btn" href="#trhy" style="text-decoration:none">💰 Kurzy a hodnota</a><a class="btn" href="#hraci" style="text-decoration:none">🎯 Hráči</a></div>
     </div>
 
+    ${d.retro || ["LIVE", "CRIT", "FINAL", "OFF"].includes(d.state) ? `<div class="retro">${["LIVE", "CRIT"].includes(d.state) ? "🚨 <b>Zápas se právě hraje.</b>" : "<b>Zápas už začal nebo skončil.</b>"}
+      Předpověď níže je spočítaná jen z dat <b>před zápasem</b>, takže ji můžeš porovnat se skutečností. <a href="#live-${d.id}">Otevřít Live hřiště / záznam →</a></div>` : ""}
     <div class="statrow">
       <div class="card stat"><h4>🏒 Střely na branku</h4><div class="total">${d.shots.total.exp} <small>celkem</small></div>${cmp(d.shots.home.exp, d.shots.away.exp, (x) => x.toFixed(1))}
         <p class="help">Kolik <b>střel na branku</b> čekáme za oba týmy dohromady (velké číslo) a za každý tým zvlášť (pruhy). Ligový průměr je ${d.league.shots.toFixed(1)} střel na tým.</p></div>
@@ -2678,6 +3205,35 @@ function renderGame() {
         <p class="help">Kolik <b>trestů (vyloučení)</b> čekáme. Číslo u týmu = kolikrát půjdou <b>jeho</b> hráči na trestnou lavici. Ligový průměr je ${d.league.pens.toFixed(1)} na tým.</p></div>
       <div class="card stat"><h4>🥅 Góly</h4><div class="total">${d.goals.total.toFixed(1)} <small>celkem</small></div>${cmp(d.goals.home, d.goals.away, (x) => x.toFixed(2))}
         <p class="help">Kolik <b>gólů</b> čekáme celkem a za každý tým. Ligový průměr je ${d.league.goals.toFixed(2)} gólu na tým.</p></div>
+    </div>
+
+    <div class="sechead"><span class="no">⚖</span><h2>Klíčové faktory</h2><span class="hint">přesilovky, oslabení, vhazování, marodka</span></div>
+    <div class="grid g3">
+      <div class="card"><b>Speciální týmy a vhazování</b>
+        <p class="help" style="margin:4px 0 10px"><b>Přesilovka %</b> = jak často tým dá gól, když má o hráče víc. <b>Oslabení %</b> = jak často ubrání, když má o hráče míň. <b>Vhazování %</b> = kolik vhazování vyhraje. Vyšší = lepší.</p>
+        ${(() => { const a = d.special?.[H] || {}, b = d.special?.[A] || {};
+          const row = (lab, x, y) => { if (x == null || y == null) return ""; const mx = Math.max(x, y) || 1;
+            return `<div class="cmprow"><div class="lab">${lab}</div>
+              <div class="r"><span class="b"><i data-w="${(x / mx) * 100}" style="background:var(--home)"></i></span><span class="v" style="color:var(--home)">${H} ${(x * 100).toFixed(1)} %</span></div>
+              <div class="r"><span class="b"><i data-w="${(y / mx) * 100}" style="background:var(--away)"></i></span><span class="v" style="color:var(--away)">${A} ${(y * 100).toFixed(1)} %</span></div></div>`; };
+          const pp = a.pp != null && b.pk != null ? `<p class="help">⚡ Přesilovka ${H} (${(a.pp * 100).toFixed(0)} %) proti oslabení ${A} (${(b.pk * 100).toFixed(0)} %) · přesilovka ${A} (${(b.pp * 100).toFixed(0)} %) proti oslabení ${H} (${(a.pk * 100).toFixed(0)} %).</p>` : "";
+          return (row("Přesilovka %", a.pp, b.pp) + row("Oslabení %", a.pk, b.pk) + row("Vhazování %", a.fo, b.fo) + pp) || `<p class="help">Data zatím nejsou.</p>`; })()}
+      </div>
+      <div class="card"><b>🩹 Marodka</b>
+        <p class="help" style="margin:4px 0 10px">Zranění a vyřazení hráči (zdroj ESPN). Hráči označení jako <b>mimo hru</b> se do předpovědi nepočítají. <b>Day-To-Day</b> = nejisté, jestli nastoupí.</p>
+        ${[H, A].map((t) => { const L = d.injuries?.[t] || []; return `<div style="margin-top:8px"><b style="color:${t === H ? "var(--home)" : "var(--away)"}">${t}</b>${L.length ? L.map((i) =>
+          `<div class="gk"><span><b>${esc(i.name)}</b><br><small class="muted">${esc(i.comment || "")}</small></span><span style="text-align:right"><span class="injbadge ${i.out ? "" : "dtd"}">${esc(i.status)}</span>${i.pts != null ? `<br><small class="muted">${i.pts} b. v sezóně</small>` : ""}</span></div>`).join("")
+          : `<p class="help">Nikdo zraněný ✅</p>`}</div>`; }).join("")}
+      </div>
+      <div class="card books"><b>💰 Kurzy sázkovek na vítěze</b>
+        <p class="help" style="margin:4px 0 10px">Kurzy z oficiálních dat NHL. <b>Zelená</b> = nejlepší kurz. Sloupec <b>hodnota</b> ukazuje, jestli se sázka podle modelu vyplatí (kladné = ano). Sázkovky označené „1X2“ nabízejí sázku jen na základní hrací dobu (bez prodloužení).</p>
+        ${(d.odds?.books || []).length ? `<div class="tablewrap" style="background:none"><table class="t"><thead><tr><th class="left">Sázkovka</th><th>${H}</th><th>${A}</th><th>Hodnota ${H}</th><th>Hodnota ${A}</th></tr></thead><tbody>
+          ${(() => { const B = d.odds.books, bh = Math.max(...B.filter((x) => !x.reg).map((x) => x.home), 0), ba = Math.max(...B.filter((x) => !x.reg).map((x) => x.away), 0);
+            return B.map((b) => `<tr><td class="left"><b>${esc(b.name)}</b> <small class="muted">${esc(b.country || "")}${b.reg ? " · 1X2" : ""}</small></td>
+              <td class="${!b.reg && b.home === bh ? "best" : ""}">${b.home.toFixed(2)}</td><td class="${!b.reg && b.away === ba ? "best" : ""}">${b.away.toFixed(2)}</td>
+              <td>${evHtml(b.pHome, b.home)}</td><td>${evHtml(b.pAway, b.away)}</td></tr>`).join(""); })()}
+          </tbody></table></div>` : `<p class="help">Kurzy k tomuto zápasu zatím nejsou.</p>`}
+      </div>
     </div>
 
     <div class="sechead"><span class="no">▶</span><h2>Simulace zápasu</h2><span class="hint">počítač odehraje zápas 1000×</span></div>
@@ -2836,6 +3392,7 @@ function renderGame() {
   $("cpl").onchange = loadCalcOdd; $("cmk").onchange = loadCalcOdd; $("codd").oninput = renderCalc;
   renderMarkets(); renderPlayers(); loadCalcOdd();
   initSlider(); initSim(); initRink(); initCompare();
+  requestAnimationFrame(() => setTimeout(() => $("view-game").querySelectorAll(".cmprow i[data-w]").forEach((i) => (i.style.width = i.dataset.w + "%")), 60));
   $("sladdo").onclick = (e) => slAdd(true, e.target); $("sladdu").onclick = (e) => slAdd(false, e.target);
   $("caddbtn").onclick = (e) => {
     const p = GAME.players.find((x) => x.id === +$("cpl").value), mk = $("cmk").value;
@@ -3201,7 +3758,7 @@ function movePuck(e) {
 function evText(e) {
   const w = e.who ? `<b>${esc(e.who.name)}</b>${e.who.num != null ? " #" + e.who.num : ""}` : "";
   let t = `${EVCZ[e.type]} ${e.team ? `<span class="muted">${e.team}</span>` : ""} ${w}`;
-  if (e.type === "goal") t = `<b style="color:var(--gold)">🚨 GÓL ${e.team}!</b> ${w}${e.extra?.length ? `<small>asistence: ${e.extra.map((a) => esc(a.name)).join(", ")}</small>` : "<small>bez asistence</small>"}${e.score ? `<small>stav ${e.score[0]}:${e.score[1]}</small>` : ""}`;
+  if (e.type === "goal") t = `<b style="color:var(--gold)">🚨 GÓL ${e.team}!</b> ${w}${e.extra?.length ? `<small>asistence: ${e.extra.map((a) => esc(a.name)).join(", ")}</small>` : "<small>bez asistence</small>"}${e.score ? `<small>stav ${e.score[0]}:${e.score[1]}${e.clip ? ` · <a href="${esc(e.clip)}" target="_blank" rel="noopener">▶ video</a>` : ""}</small>` : ""}`;
   if (e.type === "penalty") t += `<small>${PENCZ[e.desc] || esc(e.desc || "")} · ${e.dur || 2} min</small>`;
   if (e.type === "hit" && e.extra?.length) t += `<small>do hráče ${esc(e.extra[0].name)}</small>`;
   return t;
@@ -3240,7 +3797,8 @@ function renderLive() {
         <div class="sechead" style="margin-top:20px"><h2 style="font-size:34px">Po třetinách</h2></div><div class="tablewrap"><table class="t" id="lper-t"></table></div>
         <p class="help">G = góly, Střely = na branku, Mimo = střely vedle, Zblok. = střely, které soupeř zblokoval, Hity = bodyčeky, Vyl. = počet vyloučení (v závorce trestné minuty).</p>
       </div>
-      <div class="card"><b>📰 Průběh zápasu</b><p class="help" style="margin:4px 0 8px">Nejnovější akce nahoře.</p><div class="feed" id="lfeed"></div></div>
+      <div><div class="card"><b>🚨 Góly zápasu</b><p class="help" style="margin:4px 0 8px"><b>▶ Video</b> otevře záznam gólu na NHL.com. <b>AI rozbor</b> vysvětlí, jak gól padl (odkud se střílelo, jestli to byla dorážka, protiútok nebo přesilovka) – AI video nevidí, popisuje gól podle dat zápasu.</p><div id="lgoals"></div></div>
+        <div class="card" style="margin-top:14px"><b>📰 Průběh zápasu</b><p class="help" style="margin:4px 0 8px">Nejnovější akce nahoře.</p><div class="feed" id="lfeed"></div></div></div>
     </div>
     <div class="sechead"><h2 style="font-size:40px">Hráči</h2><span class="hint">seřazeno podle střel na branku</span></div>
     <p class="help" style="margin-top:-6px"><b>Střely</b> = střely na branku v tomto zápase, za lomítkem kolik jich čekal model (✅ = už splnil). <b>TM</b> = trestné minuty, <b>+/-</b> = plus/minus, <b>TOI</b> = čas na ledě.</p>
@@ -3271,8 +3829,19 @@ function updatePanels(upto) {
   $("lsoga").textContent = replay ? c[A].sog : d.away.sog ?? c[A].sog;
   const fin = ["FINAL", "OFF"].includes(d.state);
   $("lclk").innerHTML = replay ? `▶ záznam · ${last ? PERCZ(last.per) + " · " + last.time : ""}`
-    : fin ? `Konec zápasu${d.end && d.end !== "REG" ? " (" + d.end + ")" : ""}` : d.period ? `<span class="livedot"></span> ${PERCZ(d.period, d.periodType)} · ${d.clock?.inIntermission ? "přestávka" : (d.clock?.timeRemaining || "") + " do konce"}` : "";
+    : fin ? `Konec zápasu${d.end && d.end !== "REG" ? " (" + (d.end === "SO" ? "po nájezdech" : "po prodloužení") + ")" : ""}` : d.period ? `<span class="livedot"></span> ${PERCZ(d.period, d.periodType)} · ${d.clock?.inIntermission ? "přestávka" : (d.clock?.timeRemaining || "") + " do konce"}` : "";
   $("lsit").innerHTML = replay ? sitInfo(last?.sit, { ...d, state: "LIVE" }) : sitInfo(d.situation, d);
+  const goalsEv = evs.filter((e) => e.type === "goal");
+  const gEl = $("lgoals");
+  if (gEl && gEl.dataset.n !== String(goalsEv.length)) {
+    gEl.dataset.n = goalsEv.length;
+    gEl.innerHTML = goalsEv.length ? goalsEv.map((e) => `<div class="goalrow" data-eid="${e.id}"><span class="t">${e.score ? e.score[0] + ":" + e.score[1] : ""}</span>
+      <span><b>${e.who ? `<span class="pname-link" data-player="${e.who.id}:${e.team}">${esc(e.who.name)}</span>` : ""}</b> <span class="muted">${e.team} · ${PERCZ(e.per)} ${e.time}</span>
+        <small class="muted" style="display:block">${e.extra?.length ? "asistence: " + e.extra.map((a) => esc(a.name)).join(", ") : "bez asistence"}${e.shotType ? " · střela: " + esc(SHOTCZ[e.shotType] || e.shotType) : ""}</small></span>
+      <span class="acts">${e.clip ? `<a class="addbtn" href="${esc(e.clip)}" target="_blank" rel="noopener" style="text-decoration:none">▶ Video</a>` : ""}<button class="addbtn" data-ai="${e.id}">🤖 AI rozbor</button></span></div>`).join("")
+      : `<p class="help">Zatím žádný gól.</p>`;
+    gEl.querySelectorAll("[data-ai]").forEach((b) => (b.onclick = () => goalAI(+b.dataset.ai, b)));
+  }
   $("lfeed").innerHTML = evs.filter((e) => e.type !== "faceoff").slice(-40).reverse().map((e) =>
     `<div class="fe ${e.type === "goal" ? "goal" : ""}"><span class="tm">${e.per}. ${e.time}</span><span>${EVICO[e.type]}</span><span>${evText(e)}</span></div>`).join("") || `<p class="help">Zatím žádné akce.</p>`;
   // třetiny
@@ -3300,11 +3869,25 @@ function updatePanels(upto) {
     const rows = [...p.skaters].sort((a, b) => b.sog - a.sog || b.pts - a.pts);
     return `<div class="card"><b style="color:${t === H ? "var(--home)" : "var(--away)"};font-size:18px">${t}</b>
       <div class="tablewrap" style="margin-top:8px;background:none"><table class="t"><thead><tr><th class="left">#</th><th class="left">Hráč</th><th>G</th><th>A</th><th>Střely</th><th>TM</th><th>Hity</th><th>Bloky</th><th>+/-</th><th>TOI</th></tr></thead><tbody>
-      ${rows.map((r) => { const ex = pre?.players?.[r.id]?.expShots; return `<tr><td class="left pos">${r.num ?? ""}</td><td class="left"><b>${esc(r.name)}</b>${r.pts ? ` <span class="pill hot">${r.pts} b.</span>` : ""}</td>
+      ${rows.map((r) => { const ex = pre?.players?.[r.id]?.expShots; return `<tr><td class="left pos">${r.num ?? ""}</td><td class="left"><b class="pname-link" data-player="${r.id}:${t}">${esc(r.name)}</b>${r.pts ? ` <span class="pill hot">${r.pts} b.</span>` : ""}</td>
         <td>${r.g}</td><td>${r.a}</td><td class="gold">${r.sog}${ex != null ? `<small class="muted">/${ex.toFixed(1)}</small>${r.sog >= ex ? " ✅" : ""}` : ""}</td><td>${r.pim}</td><td>${r.hits}</td><td>${r.blk}</td>
         <td>${r.pm > 0 ? "+" + r.pm : r.pm}</td><td>${toi(r.toi)}</td></tr>`; }).join("")}</tbody></table></div>
       ${p.goalies.map((g) => `<p class="help">🧤 <b>${esc(g.name)}</b>: ${g.sv} zákroků z ${g.sa} střel (${g.sa ? ((g.sv / g.sa) * 100).toFixed(1) : "–"} %), ${g.ga} gólů</p>`).join("")}</div>`;
   }).join("");
+}
+const SHOTCZ = { wrist: "zápěstím", snap: "švihem", slap: "golfák", backhand: "bekhend", "tip-in": "teč", deflected: "tečovaná", "wrap-around": "zpoza branky", poke: "šťouchnutí", bat: "z voleje", cradle: "lakros", "between-legs": "mezi nohama" };
+async function goalAI(eid, btn) {
+  const row = btn.closest(".goalrow");
+  let out = row.querySelector(".airesp");
+  if (!out) { out = document.createElement("div"); out.className = "airesp"; row.appendChild(out); }
+  out.innerHTML = `<span class="typing"><span></span><span></span><span></span></span> AI rozebírá gól…`;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/model/goalai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ gameId: LV.id, eventId: eid }) });
+    const j = await r.json();
+    out.innerHTML = j.reply ? md(j.reply) : `<span class="err">${esc(j.error || "AI neodpověděla.")}</span>`;
+  } catch (e) { out.innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  btn.disabled = false;
 }
 function updateLive(prevGoals) {
   const d = LV.data;
@@ -3409,6 +3992,179 @@ async function loadAcc() {
 
 // PWA
 if ("serviceWorker" in navigator) { try { navigator.serviceWorker.register("/sw.js").catch(() => {}); } catch (e) {} }
+
+// ===================================================================
+//  NHL ID karta
+// ===================================================================
+const IDS = { teams: null, team: null, players: [], pid: null, theme: "neon", nick: "" };
+const ID_THEMES = {
+  sunset: "linear-gradient(160deg, #ffffff 0%, #eef2f7 55%, #dfe6ef 100%)",
+  neon: "linear-gradient(160deg, color-mix(in srgb, var(--tc) 22%, #ffffff) 0%, #ffffff 60%, color-mix(in srgb, var(--tc) 12%, #ffffff) 100%)",
+  ice: "linear-gradient(160deg, #f4f8fc 0%, #c9d4e2 45%, #f4f8fc 70%, #aeb9c8 100%)",
+};
+const proxImg = (u) => (u ? "/img?u=" + encodeURIComponent(u) : "");
+function barcode(seed) {
+  let s = "", x = 0, r = seed || 12345;
+  for (let i = 0; i < 46; i++) { r = (r * 9301 + 49297) % 233280; const w = 1 + (r % 3); if (i % 2 === 0) s += `<rect x="${x}" y="0" width="${w}" height="40" fill="#1d0b2a"/>`; x += w; }
+  return `<svg class="bar" viewBox="0 0 ${x} 40" preserveAspectRatio="none">${s}</svg>`;
+}
+async function openCard(arg) {
+  const el = $("view-card");
+  if (!IDS.teams) {
+    el.innerHTML = `<div class="loader"><div class="spinner"></div>Načítám týmy…</div>`;
+    try {
+      const d = await getJSON("/api/standings/now");
+      IDS.teams = (d.standings || []).map((t) => ({ ab: t.teamAbbrev?.default, name: t.teamName?.default, logo: t.teamLogo })).filter((t) => t.ab).sort((a, b) => a.name.localeCompare(b.name, "cs"));
+    } catch (e) { el.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  }
+  const [qt, qp] = (arg || "").split("-");
+  if (qt && IDS.teams.find((t) => t.ab === qt)) IDS.team = qt;
+  if (!IDS.team) IDS.team = store.get("nhl_team") && IDS.teams.find((t) => t.ab === store.get("nhl_team")) ? store.get("nhl_team") : IDS.teams[0].ab;
+  if (qp) IDS.pid = +qp;
+  el.innerHTML = `
+    <section class="cine hero2" id="cine" style="min-height:44vh"><div class="sky"></div><div class="sun"></div>${SKYLINE}
+      <div><span class="badge-gta">NHL · Player ID</span></div>
+      <h1 class="display"><span class="ln"><i>NHL ID</i></span><span class="ln"><i>karta hráče</i></span></h1>
+      <p class="lead">Vyber tým a hráče a vznikne jeho oficiální karta v barvách týmu – s čísly ze sezóny a dnešní předpovědí. Klikni na kartu a otočí se.</p></section>
+    <div class="idwrap">
+      <div class="card idctl">
+        <div class="row"><label>Tým</label><select id="idteam">${IDS.teams.map((t) => `<option value="${t.ab}" ${t.ab === IDS.team ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></div>
+        <div class="row"><label>Hráč</label><select id="idplayer"><option>Načítám…</option></select></div>
+        <div class="row"><label>Přezdívka (nepovinné)</label><input id="idnick" type="text" maxlength="22" placeholder="např. Ledová bestie" value="${esc(IDS.nick)}"></div>
+        <div class="row"><label>Styl karty (venkovní · domácí · stříbrná)</label><div class="themes" id="idthemes">
+          ${Object.entries(ID_THEMES).map(([k, v]) => `<button data-v="${k}" class="${k === IDS.theme ? "on" : ""}" style="background:${v}" title="${k}"></button>`).join("")}</div></div>
+        <div class="row" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="idflip">↻ Otočit kartu</button><button class="btn primary" id="iddl">Stáhnout jako obrázek</button>
+          <button class="btn" id="idmore">Analýza hráče</button></div>
+        <p class="help">Na počítači najeď myší na kartu – holografický odlesk se hýbe jako u pravé karty. Přední strana = údaje hráče, zadní = statistiky sezóny, forma a dnešní šance.</p>
+      </div>
+      <div><div class="idstage"><div class="idcard" id="idcard"><div class="loader">Vyber hráče…</div></div></div><p class="idnote" id="idnote"></p></div>
+    </div>`;
+  $("idteam").onchange = (e) => { IDS.team = e.target.value; IDS.pid = null; loadIdPlayers(); };
+  $("idplayer").onchange = (e) => { IDS.pid = +e.target.value; renderId(); };
+  $("idnick").oninput = (e) => { IDS.nick = e.target.value; renderId(); };
+  segment($("idthemes"), (v) => { IDS.theme = v; renderId(); });
+  $("idflip").onclick = () => $("idcard").classList.toggle("flip");
+  $("iddl").onclick = downloadId;
+  $("idmore").onclick = () => { const p = IDS.players.find((x) => x.playerId === IDS.pid); if (p) openPlayer(p.playerId, IDS.team, `${p.firstName.default} ${p.lastName.default}`); };
+  interactive(el);
+  loadIdPlayers();
+}
+async function loadIdPlayers() {
+  try {
+    const d = await getJSON(`/api/club-stats/${IDS.team}/now`);
+    IDS.players = (d.skaters || []).sort((a, b) => b.points - a.points);
+    IDS.goalies = d.goalies || [];
+  } catch (e) { $("idcard").innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (!IDS.pid || !IDS.players.find((p) => p.playerId === IDS.pid)) IDS.pid = IDS.players[0]?.playerId;
+  $("idplayer").innerHTML = IDS.players.map((p) => `<option value="${p.playerId}" ${p.playerId === IDS.pid ? "selected" : ""}>${esc(name(p))} – ${p.points} b.</option>`).join("");
+  renderId();
+}
+async function renderId() {
+  const t = IDS.teams.find((x) => x.ab === IDS.team), p = IDS.players.find((x) => x.playerId === IDS.pid);
+  if (!p) return;
+  history.replaceState(null, "", `#karta-${IDS.team}-${p.playerId}`);
+  let log = null;
+  try { log = await getJSON(`/model/player?id=${p.playerId}&team=${IDS.team}`); } catch (e) {}
+  if (IDS.pid !== p.playerId) return;
+  const num = log?.games?.length ? "" : "";
+  const nm = name(p), [first, last] = splitName(nm);
+  const jersey = log?.num ?? "";
+  const card = $("idcard");
+  const flipped = card.classList.contains("flip");
+  const games = log?.games?.slice(-10) || [];
+  const mx = Math.max(1, ...games.map((g) => g.pts));
+  const spark = games.map((g, i) => `<rect x="${i * 10 + 1}" y="${30 - (g.pts / mx) * 28}" width="7" height="${Math.max(2, (g.pts / mx) * 28)}" rx="1.5" fill="${g.pts ? "#ffc24b" : "#6b4a7a"}"/>`).join("");
+  const inj = log?.injury;
+  card.style.setProperty("--cardbg", ID_THEMES[IDS.theme]);
+  card.style.setProperty("--tc", tcol(IDS.team));
+  card.innerHTML = `
+    <div class="idface front"><div class="bg"></div>
+      <div class="hdr"><b>NHL · PLAYER ID</b><span>${esc(t?.name || IDS.team)}</span></div>
+      <div class="photo"><div class="num">${jersey || posName[p.positionCode] || "#"}</div><img src="${proxImg(t?.logo)}" alt="" crossorigin="anonymous"></div>
+      <svg class="stamp" viewBox="0 0 100 100"><path d="M50 4l40 16v26c0 25-18 42-40 50C28 88 10 71 10 46V20z" fill="#05070b" stroke="#c9d4e2" stroke-width="4"/>
+        <text x="50" y="44" text-anchor="middle" font-family="Anton" font-size="18" fill="#fff">SEZÓNA</text><text x="50" y="70" text-anchor="middle" font-family="Anton" font-size="24" fill="${tcol(IDS.team)}">26/27</text></svg>
+      <div class="fields">
+        <div class="wide"><small>JMÉNO / NAME</small><b>${esc(first)} ${esc(last)}</b></div>
+        <div><small>POZICE</small><b>${{ C: "Center", L: "Levé křídlo", R: "Pravé křídlo", D: "Obránce" }[p.positionCode] || p.positionCode}</b></div>
+        <div><small>TÝM</small><b>${esc(IDS.team)}</b></div>
+        <div><small>ZÁPASY · BODY</small><b>${p.gamesPlayed} · ${p.points}</b></div>
+        <div><small>STAV</small><b style="color:${inj ? (inj.out ? "#c81e4a" : "#b7791f") : "#127a52"}">${inj ? esc(inj.status) : "Fit"}</b></div>
+        ${IDS.nick ? `<div class="wide"><small>PŘEZDÍVKA</small><b style="font-size:clamp(16px,2.6vw,24px)">„${esc(IDS.nick)}“</b></div>` : ""}
+        <div><small>ID Č.</small><b>${p.playerId}</b></div>
+      </div>
+      <div class="sig">${esc(last)}</div>${barcode(p.playerId)}
+      <div class="holo"></div></div>
+    <div class="idface back"><div class="bg"></div>
+      <div class="hdr"><b>STATISTIKY</b><span>${esc(nm)}</span></div>
+      <div class="bstats">
+        <div><small>GÓLY</small><b>${p.goals}</b></div><div><small>ASISTENCE</small><b>${p.assists}</b></div>
+        <div><small>BODY</small><b>${p.points}</b></div><div><small>B / ZÁPAS</small><b>${(p.points / Math.max(1, p.gamesPlayed)).toFixed(2)}</b></div>
+        <div><small>STŘELY</small><b>${p.shots}</b></div><div><small>% STŘELBY</small><b>${p.shootingPctg != null ? (p.shootingPctg * 100).toFixed(1) : "–"}</b></div>
+        <div><small>+/-</small><b>${p.plusMinus > 0 ? "+" + p.plusMinus : p.plusMinus}</b></div><div><small>ČAS NA LEDĚ</small><b>${toi(p.avgTimeOnIcePerGame)}</b></div>
+        <div class="spark"><small>BODY V POSLEDNÍCH ${games.length} ZÁPASECH</small><svg viewBox="0 0 100 32" preserveAspectRatio="none" style="width:100%;height:40px">${spark}</svg></div>
+        ${log?.next ? `<div class="spark" style="background:linear-gradient(90deg,#0d47c9,#2f7bff)"><small style="color:#fff">DNES ${esc(log.next.game)}</small><b style="color:#fff">${pc(log.next.pPoint)} na bod</b></div>` : ""}
+      </div><div class="holo"></div></div>`;
+  if (flipped) card.classList.add("flip");
+  card.onclick = () => card.classList.toggle("flip");
+  card.onmousemove = (e) => {
+    const r = card.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    card.querySelectorAll(".holo").forEach((h) => { h.style.setProperty("--hx", x * 100 + "%"); h.style.setProperty("--hy", y * 100 + "%"); });
+    card.style.transform = `${card.classList.contains("flip") ? "rotateY(180deg) " : ""}rotateX(${(0.5 - y) * 10}deg) rotateY(${(x - 0.5) * 14}deg)`;
+  };
+  card.onmouseleave = () => (card.style.transform = "");
+  $("idnote").textContent = inj ? `Marodka: ${inj.status}${inj.comment ? " – " + inj.comment : ""}` : "Klikni na kartu a otočí se.";
+}
+const LAST_NUMS = {};
+async function downloadId() {
+  const card = $("idcard");
+  try {
+    if (!window.htmlToImage) await new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js"; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+    const face = card.classList.contains("flip") ? card.querySelector(".back") : card.querySelector(".front");
+    const prev = card.style.transform; card.style.transform = card.classList.contains("flip") ? "rotateY(180deg)" : "";
+    const url = await window.htmlToImage.toPng(face, { pixelRatio: 2, style: { transform: "none" } });
+    card.style.transform = prev;
+    const a = document.createElement("a"); a.href = url; a.download = `nhl-id-${IDS.team}-${IDS.pid}.png`; a.click();
+  } catch (e) { alert("Obrázek se nepodařilo vytvořit. Zkus to v jiném prohlížeči."); }
+}
+
+// ===================================================================
+//  Analýza hráče (okno)
+// ===================================================================
+async function openPlayer(pid, team, nm) {
+  const m = $("pmodal"), box = $("pmbox");
+  m.classList.remove("hidden");
+  box.innerHTML = `<button class="x" onclick="closePlayer()">✕</button><div class="loader"><div class="spinner"></div>Načítám ${esc(nm || "hráče")}…</div>`;
+  let d;
+  try { d = await getJSON(`/model/player?id=${pid}&team=${team}`); } catch (e) { box.innerHTML += `<p class="err">${esc(e.message)}</p>`; return; }
+  const g = d.games;
+  const labels = g.map((x) => (x.home ? "" : "@") + x.opp);
+  box.innerHTML = `<button class="x" onclick="closePlayer()">✕</button>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap"><div class="display" style="font-size:44px;background:var(--sunset);-webkit-background-clip:text;background-clip:text;color:transparent">${esc(d.name || nm)}</div>
+      <span class="pill">${esc(team)}</span>${d.injury ? `<span class="injbadge ${d.injury.out ? "" : "dtd"}">🩹 ${esc(d.injury.status)}</span>` : `<span class="pill good">fit</span>`}</div>
+    ${d.injury?.comment ? `<p class="help">${esc(d.injury.comment)} (${esc(d.injury.date)})</p>` : ""}
+    <div class="simstats" style="margin-top:14px">
+      <div><small>Body na zápas</small><b>${num(d.avg.pts)}</b></div><div><small>Zápasy s bodem</small><b>${pc(d.avg.pointRate)}</b></div>
+      <div><small>Střely na zápas</small><b>${num(d.avg.sog, 1)}</b></div><div><small>Čas na ledě</small><b>${toi(d.avg.toi)}</b></div>
+      <div><small>Doma</small><b>${d.home.pts} b.</b><small>v ${d.home.gp} záp.</small></div><div><small>Venku</small><b>${d.away.pts} b.</b><small>v ${d.away.gp} záp.</small></div>
+    </div>
+    ${d.next ? `<div class="retro"><b>Další zápas: ${esc(d.next.game)}</b> · šance na bod <b style="color:var(--gold)">${pc(d.next.pPoint)}</b> · na gól ${pc(d.next.pGoal)} · 2+ body ${pc(d.next.p2Points)} · oček. střely ${num(d.next.expShots, 1)}
+      <a href="#zapas-${d.next.gid}" onclick="closePlayer()" style="margin-left:8px">rozbor zápasu →</a></div>` : ""}
+    <h3 style="margin:18px 0 4px">Posledních ${g.length} zápasů</h3>
+    <p class="help" style="margin:0 0 6px">Žluté sloupce = kanadské body v zápase, modrá čára = střely na branku. @ = venku.</p>
+    ${chart({ labels, bars: [{ name: "Body", color: "#ffc24b", values: g.map((x) => x.pts) }], lines: [{ name: "Střely", color: "#2de2e6", values: g.map((x) => x.sog) }], height: 170 })}
+    <div class="tablewrap" style="margin-top:12px"><table class="t"><thead><tr><th class="left">Datum</th><th class="left">Soupeř</th><th>Výsledek</th><th>G</th><th>A</th><th>B</th><th>Střely</th><th>Hity</th><th>TM</th><th>TOI</th></tr></thead><tbody>
+      ${g.slice().reverse().map((x) => `<tr><td class="left">${fmtDate(x.date)}</td><td class="left">${x.home ? "" : "@"}${x.opp}</td><td>${x.res === "V" ? "✅" : "❌"} ${x.score}</td><td>${x.g}</td><td>${x.a}</td><td class="gold">${x.pts}</td><td>${x.sog}</td><td>${x.hits}</td><td>${x.pim}</td><td>${toi(x.toi)}</td></tr>`).join("")}
+    </tbody></table></div>
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap"><a class="btn" href="#karta-${team}-${pid}" onclick="closePlayer()" style="text-decoration:none">🪪 Vytvořit NHL ID kartu</a>
+      <button class="btn primary" onclick="closePlayer();openChat();sendChat('Rozeber mi formu hráče ${esc((d.name || nm || "").replace(/'/g, ""))} (${team}) a jeho šance v dalším zápase.')">🤖 AI rozbor hráče</button></div>`;
+}
+function closePlayer() { $("pmodal").classList.add("hidden"); }
+$("pmodal").onclick = (e) => { if (e.target.id === "pmodal") closePlayer(); };
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePlayer(); });
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("[data-player]");
+  if (a) { e.preventDefault(); e.stopPropagation(); const [pid, team] = a.dataset.player.split(":"); openPlayer(+pid, team, a.textContent); }
+}, true);
 
 // ===================================================================
 //  AI chat
