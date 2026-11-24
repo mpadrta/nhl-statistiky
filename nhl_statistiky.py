@@ -547,7 +547,7 @@ def league_averages(games, pens):
             "ppConv": round(ppg / max(p, 0.1), 4)}
 
 
-REG_BOOKS = {"veikkaus", "doxxbet"}  # tyto sázkovky v NHL datech uvádějí kurz na základní hrací dobu (1X2)
+REG_BOOKS = {"doxxbet"}  # tyto sázkovky v NHL datech uvádějí kurz na základní hrací dobu (1X2)
 
 
 def _dec(v):
@@ -1456,6 +1456,376 @@ def chat(messages, gid=None, system_override=False):
 
 
 # ---------------------------------------------------------------------------
+#  Tikety z Tipsportu – přečtení (AI), spárování se zápasy, vyhodnocení
+# ---------------------------------------------------------------------------
+def gemini_generate(contents, system, as_json=False, max_tokens=8192, temperature=0.3):
+    key = gemini_key()
+    if not key:
+        return {"error": "AI zatím není zapnutá – chybí klíč GEMINI_API_KEY."}
+    cfg = {"temperature": temperature, "maxOutputTokens": max_tokens}
+    if as_json:
+        cfg["responseMimeType"] = "application/json"
+    body = json.dumps({"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg}).encode()
+    last = None
+    for model in gemini_models(key)[:5]:
+        url = f"{GEMINI_API}models/{model}:generateContent?key={urllib.parse.quote(key)}"
+        try:
+            d = json.loads(http_get(url, data=body, headers={"Content-Type": "application/json"}, timeout=90))
+            cand = (d.get("candidates") or [{}])[0]
+            text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", []) if not p.get("thought"))
+            if text.strip():
+                return {"text": text.strip(), "model": model}
+            last = "prázdná odpověď"
+        except urllib.error.HTTPError as e:
+            try:
+                last = f"{e.code} {json.loads(e.read()).get('error', {}).get('message', '')[:160]}"
+            except Exception:
+                last = str(e.code)
+        except Exception as e:
+            last = str(e)
+    return {"error": f"AI teď neodpovídá ({last})."}
+
+
+TICKET_SCHEMA = """Vrať POUZE JSON tohoto tvaru:
+{"stake": číslo nebo null, "totalOdds": číslo nebo null, "possibleWin": číslo nebo null, "type": "AKO"|"SOLO"|"SYSTEM"|null, "date": "YYYY-MM-DD" nebo null,
+ "legs": [{"match": "Domácí - Hosté jak je na tiketu", "home": "domácí tým", "away": "hostující tým", "date": "YYYY-MM-DD" nebo null,
+   "market": "název sázky z tiketu", "selection": "tip z tiketu", "odds": číslo,
+   "kind": jedno z ["winner_ot","1x2","total_goals","team_goals","total_shots","team_shots","total_pens","total_pim","total_hits",
+            "player_point","player_goal","player_assist","player_2points","player_shots","first_goal_team","first_goal_player","pp_goal_team","other"],
+   "pick": jedno z ["home","away","1","0","2","10","02","12","over","under","yes","no"],
+   "line": číslo nebo null, "team": "home"|"away"|null, "player": "jméno hráče" nebo null,
+   "status": "won"|"lost"|"open"|null}]}
+Pravidla: "Zápas"/"Výsledek" s tipy 1/0/2/10/02/12 = 1x2 (základní hrací doba). "Vítěz vč. prodloužení a nájezdů"/"Postup" = winner_ot (pick home/away).
+"Počet gólů"/"Celkem gólů" = total_goals (pick over pro „více než“/„+“, under pro „méně než“/„-“, line = hranice). Góly jednoho týmu = team_goals + team.
+"Střely na branku" celkem = total_shots, jednoho týmu = team_shots. "Počet vyloučení" = total_pens, "Trestné minuty" = total_pim, "Hity" = total_hits.
+Hráč „kanadské body/bodový zisk“ = player_point (pick yes, line 0.5), „2+ body“ = player_2points, „gól v zápase/střelec gólu“ = player_goal, „asistence“ = player_assist,
+„počet střel hráče“ = player_shots (line), „první gól“ týmu = first_goal_team, hráče = first_goal_player, „gól v přesilovce“ = pp_goal_team.
+Jména týmů piš tak, jak jsou na tiketu. Když něco nevidíš, dej null. Nevymýšlej si."""
+
+
+def _team_index():
+    idx = {}
+    for ab, v in LEAGUE.info.items():
+        full = _norm(v.get("name"))
+        words = full.split()
+        keys = {ab.lower(), full}
+        if len(words) >= 2:
+            keys.add(" ".join(words[:-1]))  # „Edmonton“, „Vegas Golden“
+            keys.add(words[-1])              # „Oilers“
+            keys.add(words[0])
+        if full.startswith("new york"):
+            keys |= {"ny " + words[-1], "nyr" if "rangers" in full else "nyi"}
+        if "golden knights" in full:
+            keys |= {"vegas", "golden knights"}
+        if "st louis" in full or "st. louis" in full:
+            keys |= {"st louis", "st. louis", "louis"}
+        if "montr" in full:
+            keys |= {"montreal", "canadiens"}
+        if "utah" in full:
+            keys |= {"utah", "mammoth"}
+        if "tampa" in full:
+            keys |= {"tampa", "tampa bay"}
+        for k in keys:
+            if len(k) >= 3:
+                idx.setdefault(k, set()).add(ab)
+    return idx
+
+
+def _find_team(name, idx):
+    n = _norm(name).replace(".", "")
+    if not n:
+        return None
+    if n in idx and len(idx[n]) == 1:
+        return next(iter(idx[n]))
+    best = None
+    for k, abs_ in idx.items():
+        if len(abs_) == 1 and (k in n or n in k) and len(k) >= 4:
+            if not best or len(k) > len(best[0]):
+                best = (k, next(iter(abs_)))
+    return best[1] if best else None
+
+
+def _candidate_games():
+    """Zápasy, ke kterým může sázka patřit: nadcházející, dnešní/včerejší a z posledních 7 dní."""
+    games = {}
+    for g in LEAGUE.upcoming:
+        games[g["id"]] = {"id": g["id"], "home": g["home"], "away": g["away"], "date": g["date"], "state": g["state"], "start": g.get("start")}
+    try:
+        for g in live_games()["games"]:
+            games.setdefault(g["id"], {"id": g["id"], "home": g["home"], "away": g["away"], "date": (g["start"] or "")[:10], "state": g["state"], "start": g.get("start")})
+    except Exception:
+        pass
+    if LEAGUE.games:
+        last = max(g["date"] for g in LEAGUE.games.values())
+        since = (datetime.date.fromisoformat(last) - datetime.timedelta(days=7)).isoformat()
+        for g in LEAGUE.games.values():
+            if g["date"] >= since:
+                games.setdefault(g["id"], {"id": g["id"], "home": g["home"]["abbr"], "away": g["away"]["abbr"], "date": g["date"], "state": "OFF", "start": None})
+    return list(games.values())
+
+
+def _match_player(name, players):
+    n = _norm(name)
+    if not n:
+        return None
+    toks = [t for t in n.split() if len(t) > 1]
+    best, score = None, 0
+    for p in players:
+        pn = _norm(p["name"]).split()
+        last = pn[-1] if pn else ""
+        sc = 0
+        if last and last in toks:
+            sc += 2
+        if pn and pn[0] in toks:
+            sc += 1
+        if pn and any(t[0] == pn[0][0] for t in toks if len(t) <= 2):
+            sc += 0.5
+        if sc > score:
+            best, score = p, sc
+    return best if score >= 2 else None
+
+
+def _leg_probability(leg, p):
+    """Šance podle modelu pro jednu sázku. Vrací (šance, popis, hráč)."""
+    kind, pick, line = leg.get("kind"), str(leg.get("pick") or ""), leg.get("line")
+    try:
+        line = float(line) if line is not None else None
+    except (TypeError, ValueError):
+        line = None
+    side = leg.get("team") or ("home" if pick == "home" else "away" if pick == "away" else None)
+    w = p["win"]
+    over = pick in ("over", "yes")
+
+    def ov(prob):
+        return prob if over else 1 - prob
+
+    if kind == "winner_ot":
+        return (w["home"] if pick == "home" else w["away"] if pick == "away" else None), "vítěz vč. prodloužení", None
+    if kind == "1x2":
+        m = {"1": w["homeReg"], "0": w["ot"], "2": w["awayReg"], "10": w["homeReg"] + w["ot"], "02": w["awayReg"] + w["ot"],
+             "12": 1 - w["ot"], "home": w["homeReg"], "away": w["awayReg"]}
+        return m.get(pick), "výsledek po 60 minutách", None
+    if line is None and kind in ("total_goals", "team_goals", "total_shots", "team_shots", "total_pens", "total_pim", "total_hits", "player_shots"):
+        return None, "chybí hranice", None
+    if kind == "total_goals":
+        return ov(_pover(line, p["goals"]["total"])), f"čekáme {p['goals']['total']} gólů", None
+    if kind == "team_goals" and side:
+        return ov(_pover(line, p["goals"][side])), f"čekáme {p['goals'][side]} gólů týmu", None
+    if kind in ("total_shots", "team_shots"):
+        b = p["shots"]["total" if kind == "total_shots" else (side or "total")]
+        return ov(_nover(line, b.get("mean", b["exp"]), b.get("sd", 6))), f"čekáme {b['exp']} střel", None
+    if kind == "total_pens":
+        return ov(_pover(line, p["pens"]["total"]["exp"])), f"čekáme {p['pens']['total']['exp']} vyloučení", None
+    if kind == "total_pim":
+        lam = p["pens"]["total"]["exp"] * 2.3
+        return ov(_nover(line, lam, math.sqrt(lam * 3.2))), f"čekáme asi {lam:.1f} trestných minut (přibližně)", None
+    if kind == "total_hits" and p.get("extra"):
+        b = p["extra"]["hits"]["total"]
+        return ov(_nover(line, b["mean"], b["sd"])), f"čekáme {b['exp']} hitů", None
+    if kind == "first_goal_team" and p.get("extra"):
+        fg = p["extra"]["firstGoal"]
+        return (fg["home"] if side == "home" or pick == "home" else fg["away"]), "první gól", None
+    if kind == "pp_goal_team" and p.get("extra"):
+        pp = p["extra"]["ppGoals"]["home" if side == "home" else "away"]["p1"]
+        return (pp if pick != "no" else 1 - pp), "gól v přesilovce", None
+    if kind and kind.startswith(("player_", "first_goal_player")):
+        pl = _match_player(leg.get("player") or leg.get("selection"), p["players"])
+        if not pl:
+            return None, "hráče se nepodařilo najít", None
+        lam_s = pl["expShots"]
+        if kind == "player_point":
+            pr = pl["pPoint"]
+        elif kind == "player_goal":
+            pr = pl["pGoal"]
+        elif kind == "player_2points":
+            pr = pl.get("p2Points")
+        elif kind == "player_assist":
+            pr = 1 - math.exp(-max(0.01, pl.get("expPoints", 0) - pl.get("expGoals", 0)))
+        elif kind == "player_shots":
+            pr = ov(_pover(line, lam_s))
+        else:
+            pr = pl.get("pFirstGoal")
+        if kind in ("player_point", "player_goal", "player_2points", "player_assist", "first_goal_player") and pick == "no":
+            pr = 1 - pr
+        return pr, f"{pl['name']}: bod {round(pl['pPoint'] * 100)} %, střely {lam_s}", pl
+    return None, "tento typ sázky model neumí spočítat", None
+
+
+def _leg_result(leg, live, pl):
+    """Vyhodnocení odehrané sázky ze skutečných dat. True/False/None."""
+    kind, pick, line = leg.get("kind"), str(leg.get("pick") or ""), leg.get("line")
+    try:
+        line = float(line) if line is not None else None
+    except (TypeError, ValueError):
+        line = None
+    H, A = live["home"]["abbr"], live["away"]["abbr"]
+    hs, as_ = live["home"]["score"] or 0, live["away"]["score"] or 0
+    evs = live["events"]
+    reg = [sum(1 for e in evs if e["type"] == "goal" and e["per"] <= 3 and e["team"] == t) for t in (H, A)]
+    side = leg.get("team") or ("home" if pick == "home" else "away" if pick == "away" else None)
+    over = pick in ("over", "yes")
+
+    def cmp(v):
+        return None if line is None else ((v > line) if over else (v < line))
+
+    if kind == "winner_ot":
+        return (hs > as_) if pick == "home" else (as_ > hs) if pick == "away" else None
+    if kind == "1x2":
+        r = "1" if reg[0] > reg[1] else "2" if reg[1] > reg[0] else "0"
+        return r in {"1": "1", "0": "0", "2": "2", "10": "10", "02": "02", "12": "12", "home": "1", "away": "2"}.get(pick, "")
+    if kind == "total_goals":
+        return cmp(hs + as_ - (1 if live.get("end") == "SO" else 0))
+    if kind == "team_goals" and side:
+        v = (hs if side == "home" else as_) - (1 if live.get("end") == "SO" and ((side == "home") == (hs > as_)) else 0)
+        return cmp(v)
+    sog = {H: live["home"]["sog"] or 0, A: live["away"]["sog"] or 0}
+    if kind == "total_shots":
+        return cmp(sog[H] + sog[A])
+    if kind == "team_shots" and side:
+        return cmp(sog[H if side == "home" else A])
+    pens = [e for e in evs if e["type"] == "penalty" and (e.get("desc") or "") not in ("misconduct", "game-misconduct")]
+    if kind == "total_pens":
+        return cmp(len(pens))
+    if kind == "total_pim":
+        return cmp(sum(e.get("dur") or 0 for e in evs if e["type"] == "penalty"))
+    if kind == "total_hits":
+        return cmp(sum(1 for e in evs if e["type"] == "hit"))
+    if kind == "first_goal_team":
+        fg = next((e for e in evs if e["type"] == "goal"), None)
+        return None if not fg else (fg["team"] == (H if (side or pick) == "home" else A))
+    if pl is not None:
+        box = next((x for t in live["players"].values() for x in t["skaters"] if x["id"] == pl["id"]), None)
+        if not box:
+            return False  # nehrál
+        if kind == "player_point":
+            return (box["pts"] > 0) == (pick != "no")
+        if kind == "player_goal":
+            return (box["g"] > 0) == (pick != "no")
+        if kind == "player_assist":
+            return (box["a"] > 0) == (pick != "no")
+        if kind == "player_2points":
+            return (box["pts"] >= 2) == (pick != "no")
+        if kind == "player_shots":
+            return cmp(box["sog"])
+        if kind == "first_goal_player":
+            fg = next((e for e in evs if e["type"] == "goal"), None)
+            return bool(fg and fg.get("who") and fg["who"]["id"] == pl["id"])
+    return None
+
+
+def analyze_ticket(image_b64=None, mime="image/jpeg", text=None):
+    if not LEAGUE.ready:
+        return {"error": "Data se ještě načítají, zkus to za minutu."}
+    parts = [{"text": "Přečti tento tiket z Tipsportu (NHL hokej) a převeď ho do JSON. " + TICKET_SCHEMA}]
+    if image_b64:
+        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
+    if text:
+        parts.append({"text": "Text tiketu:\n" + text[:4000]})
+    r = gemini_generate([{"role": "user", "parts": parts}], "Jsi přesný čtenář sázkových tiketů. Odpovídáš jen validním JSON.", as_json=True, temperature=0.1)
+    if "error" in r:
+        return r
+    try:
+        raw = r["text"].strip()
+        raw = raw[raw.find("{"): raw.rfind("}") + 1]
+        tk = json.loads(raw)
+    except Exception:
+        return {"error": "AI tiket nepřečetla. Zkus ostřejší screenshot, nebo text tiketu vlož ručně."}
+    legs = tk.get("legs") or []
+    if not legs:
+        return {"error": "Na obrázku jsem nenašel žádné sázky na NHL. Je to opravdu tiket?"}
+    idx = _team_index()
+    cands = _candidate_games()
+    out = []
+    for leg in legs[:30]:
+        H = _find_team(leg.get("home") or (leg.get("match") or "").split("-")[0], idx)
+        A = _find_team(leg.get("away") or ((leg.get("match") or "") + "-").split("-")[1], idx)
+        game = None
+        opts = [g for g in cands if {g["home"], g["away"]} == {H, A}] if H and A else []
+        if opts:
+            d = leg.get("date") or tk.get("date")
+            opts.sort(key=lambda g: (0 if d and g["date"] == d else 1, 0 if g["state"] not in ("OFF", "FINAL") else 1, g["date"] or ""))
+            game = opts[0]
+            if game["home"] != H:  # tiket má týmy obráceně
+                leg["pick"] = {"home": "away", "away": "home", "1": "2", "2": "1", "10": "02", "02": "10"}.get(str(leg.get("pick")), leg.get("pick"))
+                if leg.get("team") in ("home", "away"):
+                    leg["team"] = "away" if leg["team"] == "home" else "home"
+        item = {"leg": leg, "gameId": game["id"] if game else None, "home": game["home"] if game else H, "away": game["away"] if game else A,
+                "state": game["state"] if game else None, "date": game["date"] if game else None}
+        if game:
+            pred = LEAGUE.preds.get(game["id"])
+            if not pred:
+                try:
+                    pred = LEAGUE.retro(game["id"])
+                except Exception:
+                    pred = None
+            if pred:
+                prob, note, pl = _leg_probability(leg, pred)
+                item.update(prob=prob, note=note, player=pl and {"id": pl["id"], "name": pl["name"], "team": pl["team"]})
+                odds = leg.get("odds")
+                if prob and odds:
+                    item["fair"] = round(1 / prob, 2) if prob > 0.01 else None
+                    item["ev"] = round(prob * float(odds) - 1, 4)
+                if pl and pl.get("injury"):
+                    item["warn"] = f"{pl['name']}: {pl['injury']['status']} – {pl['injury']['comment']}"
+                if pl and not pl.get("active"):
+                    item["warn"] = (item.get("warn") or "") + f" Hráč v posledních zápasech nehrál."
+            if game["state"] in ("OFF", "FINAL"):
+                try:
+                    lv = live_game(game["id"])
+                    if lv.get("state") in ("OFF", "FINAL"):
+                        item["result"] = _leg_result(leg, lv, item.get("player") and {"id": item["player"]["id"]})
+                        item["finalScore"] = f"{lv['home']['score']}:{lv['away']['score']}" + (f" {lv.get('end')}" if lv.get("end") not in (None, "REG") else "")
+                except Exception as e:
+                    print("výsledek tiketu:", e, flush=True)
+        else:
+            item["note"] = "zápas se nepodařilo najít v datech NHL (jen posledních 7 dní a nadcházející zápasy)"
+        out.append(item)
+    probs = [x.get("prob") for x in out]
+    p_all = math.prod(probs) if all(probs) else None
+    odds_all = tk.get("totalOdds") or (math.prod(float(x["leg"]["odds"]) for x in out if x["leg"].get("odds")) if all(x["leg"].get("odds") for x in out) else None)
+    results = [x.get("result") for x in out]
+    status = "lost" if any(r is False for r in results) else "won" if results and all(r is True for r in results) else "open"
+    # návrhy: nejsilnější sázky z modelu ve stejných zápasech
+    sugg = []
+    for gid in {x["gameId"] for x in out if x["gameId"]}:
+        pred = LEAGUE.preds.get(gid) or (LEAGUE.history.get(gid) or (0, None))[1]
+        if not pred or pred.get("retro"):
+            continue
+        H, A = pred["home"], pred["away"]
+        for pl in [x for x in pred["players"] if x["active"]][:3]:
+            sugg.append({"game": f"{H} – {A}", "text": f"{pl['name']} ({pl['team']}) – kanadský bod", "prob": pl["pPoint"]})
+        fav = "home" if pred["win"]["home"] >= pred["win"]["away"] else "away"
+        sugg.append({"game": f"{H} – {A}", "text": f"Vítěz vč. prodloužení – {H if fav == 'home' else A}", "prob": pred["win"][fav],
+                     "odds": (pred.get("odds") or {}).get(fav)})
+        tl = max(pred["shots"]["total"]["lines"], key=lambda l: abs(l["over"] - 0.5))
+        sugg.append({"game": f"{H} – {A}", "text": f"Střely celkem – {'přes' if tl['over'] > 0.5 else 'pod'} {tl['line']}", "prob": max(tl["over"], 1 - tl["over"])})
+    sugg.sort(key=lambda x: -x["prob"])
+    summary = {"stake": tk.get("stake"), "totalOdds": odds_all, "possibleWin": tk.get("possibleWin"), "type": tk.get("type"),
+               "pAll": p_all, "ev": (p_all * float(odds_all) - 1) if p_all and odds_all else None, "status": status}
+    # AI komentář
+    lines = []
+    for i, x in enumerate(out, 1):
+        lg = x["leg"]
+        lines.append(f"{i}. {lg.get('match')} | {lg.get('market')}: {lg.get('selection')} @ {lg.get('odds')} | model: "
+                     + (f"{round(x['prob'] * 100)} % (férový kurz {x.get('fair')}, hodnota {round((x.get('ev') or 0) * 100)} %)" if x.get("prob") else f"nelze ({x.get('note')})")
+                     + (f" | {x['note']}" if x.get('prob') and x.get('note') else "")
+                     + (f" | VAROVÁNÍ: {x['warn']}" if x.get("warn") else "")
+                     + (f" | výsledek: {'VYŠLO' if x['result'] else 'NEVYŠLO'} (skóre {x.get('finalScore')})" if x.get("result") is not None else ""))
+    ctx = (f"Tiket: typ {summary['type']}, vklad {summary['stake']}, celkový kurz {summary['totalOdds']}, šance podle modelu "
+           f"{round(p_all * 100, 1) if p_all else '?'} %, hodnota {round(summary['ev'] * 100) if summary['ev'] is not None else '?'} %, stav {status}.\n"
+           + "\n".join(lines) + "\nSilné sázky z modelu ve stejných zápasech: "
+           + "; ".join(f"{s_['game']}: {s_['text']} ({round(s_['prob'] * 100)} %)" for s_ in sugg[:6]))
+    com = gemini_generate([{"role": "user", "parts": [{"text": ctx}]}],
+                          "Jsi zkušený, ale poctivý hokejový analytik. Česky a stručně (max ~180 slov) zhodnoť tiket: které sázky jsou podle modelu "
+                          "dobré a které slabé (s čísly), na co pozor (zranění, sázky ze stejného zápasu spolu souvisí), a navrhni konkrétní úpravu tiketu "
+                          "(co vyhodit / čím nahradit – jen z uvedených dat). Pokud už je tiket vyhodnocený, okomentuj co vyšlo a co ne. "
+                          "Použij odrážky a tučné písmo. Na konci jednou větou připomeň, že jde o odhad a ať sází jen to, co si může dovolit prohrát.",
+                          temperature=0.4, max_tokens=4096)
+    return {"ticket": {k: tk.get(k) for k in ("stake", "totalOdds", "possibleWin", "type", "date")}, "legs": out, "summary": summary,
+            "suggestions": sugg[:8], "comment": com.get("text"), "commentError": com.get("error")}
+
+
+# ---------------------------------------------------------------------------
 #  Webový server
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -1596,15 +1966,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"Not found", "text/plain")
 
     def do_POST(self):
-        if self.path not in ("/model/chat", "/model/goalai"):
+        if self.path not in ("/model/chat", "/model/goalai", "/model/ticket"):
             self._send(404, b"Not found", "text/plain")
             return
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
-        if n <= 0 or n > 60000:
-            self._json({"error": "Zpráva je moc dlouhá."}, 400)
+        limit = 9_000_000 if self.path == "/model/ticket" else 60000
+        if n <= 0 or n > limit:
+            self._json({"error": "Zpráva nebo obrázek je moc velký (max. 6 MB)."}, 400)
             return
         try:
             body = json.loads(self.rfile.read(n))
@@ -1620,6 +1991,17 @@ class Handler(BaseHTTPRequestHandler):
             gid = int(gid) if gid else None
         except (TypeError, ValueError):
             gid = None
+        if self.path == "/model/ticket":
+            img, mime = body.get("image"), "image/jpeg"
+            if img and img.startswith("data:"):
+                head, img = img.split(",", 1)
+                mime = head[5:].split(";")[0] or mime
+            try:
+                res = analyze_ticket(img, mime, body.get("text"))
+            except Exception as e:
+                res = {"error": f"Vyhodnocení se nepovedlo: {e}"}
+            self._json(res, 200 if "legs" in res else 503)
+            return
         if self.path == "/model/goalai":
             try:
                 res = goal_ai(gid, int(body.get("eventId")))
@@ -2298,6 +2680,18 @@ td.gold, .gold { color: #fff !important; }
 .idface .bstats .spark { grid-column: 1 / -1; background: rgba(29,11,42,.85); color: #fff; }
 .idface .bstats .spark small { color: #9fd3ff; }
 .idnote { text-align: center; color: var(--muted); font-size: 13px; margin-top: -18px; }
+/* ---------- tikety ---------- */
+.drop { border: 2px dashed var(--line2); border-radius: 18px; padding: 30px 20px; text-align: center; cursor: pointer; transition: border-color .2s, background .2s; }
+.drop:hover, .drop.over { border-color: var(--cyan); background: rgba(76,195,255,.06); }
+.drop img { max-height: 320px; max-width: 100%; border-radius: 12px; margin-top: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+.tkgrid { display: grid; grid-template-columns: minmax(280px, 420px) 1fr; gap: 18px; align-items: start; }
+.verdict { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 12px; font-family: Anton, Impact, sans-serif; font-size: 22px; letter-spacing: .04em; text-transform: uppercase; }
+.verdict.good { background: rgba(53,211,154,.16); color: var(--green); } .verdict.bad { background: rgba(255,45,61,.16); color: #ff6b77; } .verdict.mid { background: rgba(255,209,102,.14); color: var(--gold); }
+.tkleg td small { display: block; color: var(--muted); font-size: 12px; white-space: normal; }
+.tkleg td { white-space: normal; vertical-align: top; }
+.tkhist { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; }
+.tkhist .h { flex: 0 0 auto; min-width: 180px; cursor: pointer; }
+@media (max-width: 900px) { .tkgrid { grid-template-columns: 1fr; } }
 /* ---------- modal hráče ---------- */
 #pmodal { position: fixed; inset: 0; z-index: 120; background: rgba(8,3,16,.72); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 16px; }
 #pmodal .box { width: min(860px, 100%); max-height: calc(100vh - 32px); overflow-y: auto; background: linear-gradient(180deg, #24123c, #160b26); border: 1px solid var(--line2);
@@ -2329,6 +2723,7 @@ td.gold, .gold { color: #fff !important; }
     <a href="#" id="nav-over" class="on">🔮 Předpovědi</a>
     <a href="#live" id="nav-live"><span class="livedot"></span> Live</a>
     <a href="#presnost" id="nav-acc">🎯 Přesnost</a>
+    <a href="#tikety" id="nav-tk">🎫 Tikety</a>
     <a href="#karta" id="nav-card">🪪 NHL ID</a>
     <a href="#statistiky" id="nav-stats">📊 Statistiky</a>
   </nav>
@@ -2340,6 +2735,7 @@ td.gold, .gold { color: #fff !important; }
   <section id="view-live" class="hidden"></section>
   <section id="view-acc" class="hidden"></section>
   <section id="view-card" class="hidden"></section>
+  <section id="view-tk" class="hidden"></section>
   <section id="view-stats" class="hidden">
     <div class="thead" style="margin-top:26px"><img id="slogo" alt=""><div><h1 class="page" id="stitle" style="margin:0">Statistiky týmu</h1><div class="sub" id="ssub"></div></div></div>
     <div class="controls">
@@ -2848,7 +3244,10 @@ function route() {
   const live = h === "#live" || h.startsWith("#live-");
   const acc = h === "#presnost";
   const card = h.startsWith("#karta");
-  const over = !game && !stats && !live && !acc && !card;
+  const tk = h === "#tikety";
+  const over = !game && !stats && !live && !acc && !card && !tk;
+  $("view-tk").classList.toggle("hidden", !tk);
+  $("nav-tk").classList.toggle("on", tk);
   $("view-card").classList.toggle("hidden", !card);
   $("nav-card").classList.toggle("on", card);
   $("view-over").classList.toggle("hidden", !over);
@@ -2869,6 +3268,7 @@ function route() {
   else if (live) openLive(h.startsWith("#live-") ? +h.slice(6) : null);
   else if (acc) loadAcc();
   else if (card) openCard(h.slice(7));
+  else if (tk) openTickets();
   else loadOverview();
   window.scrollTo(0, 0);
 }
@@ -2955,6 +3355,7 @@ function renderOverview() {
         <li><b>🎫 Vlevo dole je tvůj tiket</b> – v detailu zápasu přidáváš sázky tlačítkem „+ tiket“ a stránka spočítá celkový kurz a šanci.</li>
         <li>V detailu zápasu najdeš i <b>simulaci zápasu</b>, <b>hřiště se střelami</b> a <b>porovnání hráčů</b>.</li>
         <li><b>🔴 Live</b> nahoře = zápasy, které se právě hrají, na 3D hřišti s pukem. <b>🎯 Přesnost</b> = jak se modelu dařilo v odehraných zápasech.</li>
+        <li><b>🎫 Tikety</b> nahoře = nahraj screenshot tiketu z Tipsportu a AI s modelem ho vyhodnotí, opraví a okomentuje.</li>
         <li><b>🪪 NHL ID</b> nahoře = vytvoř si „občanku“ libovolného hráče ve stylu GTA. Na jméno hráče můžeš kdekoli kliknout a otevře se jeho <b>analýza</b>.</li>
         <li><b>📱 Na mobilu</b> si web můžeš dát na plochu jako aplikaci: v iPhonu Safari → tlačítko Sdílet → <b>Přidat na plochu</b>; v Androidu Chrome → menu ⋮ → <b>Přidat na plochu / Nainstalovat aplikaci</b>.</li>
       </ul></div></div>
@@ -4125,6 +4526,127 @@ async function downloadId() {
     card.style.transform = prev;
     const a = document.createElement("a"); a.href = url; a.download = `nhl-id-${IDS.team}-${IDS.pid}.png`; a.click();
   } catch (e) { alert("Obrázek se nepodařilo vytvořit. Zkus to v jiném prohlížeči."); }
+}
+
+// ===================================================================
+//  Tikety z Tipsportu
+// ===================================================================
+const TK = { img: null, busy: false, last: null };
+const KINDCZ = { winner_ot: "vítěz vč. prodloužení", "1x2": "výsledek (60 min)", total_goals: "góly celkem", team_goals: "góly týmu", total_shots: "střely celkem",
+  team_shots: "střely týmu", total_pens: "vyloučení", total_pim: "trestné minuty", total_hits: "hity", player_point: "bod hráče", player_goal: "gól hráče",
+  player_assist: "asistence hráče", player_2points: "2+ body hráče", player_shots: "střely hráče", first_goal_team: "první gól (tým)", first_goal_player: "první gól (hráč)",
+  pp_goal_team: "gól v přesilovce", other: "jiná sázka" };
+function tkHistory() { try { return JSON.parse(store.get("tk_hist") || "[]"); } catch (e) { return []; } }
+function openTickets() {
+  const el = $("view-tk");
+  const hist = tkHistory();
+  el.innerHTML = `
+    <div class="sechead" style="margin-top:30px"><span class="no">TK</span><h2>Moje tikety z Tipsportu</h2></div>
+    <div class="helpbox"><div class="help" style="margin:0"><ul>
+      <li><b>Jak na to:</b> v aplikaci Tipsport otevři tiket (v Moje tikety) a udělej <b>screenshot</b>. Ten sem nahraj – na mobilu klepni na rámeček a vyber fotku, na počítači ho sem přetáhni nebo vlož <b>Ctrl+V</b>.</li>
+      <li>AI tiket přečte, najde zápasy a hráče a <b>model každou sázku spočítá</b>: šance, férový kurz, jestli se vyplatí, zranění. U odehraných zápasů řekne, <b>co vyšlo a co ne</b>.</li>
+      <li>Pak dostaneš <b>komentář a návrh úpravy</b> – co vyhodit a čím nahradit. Funguje pro NHL zápasy z posledních 7 dní a nadcházející.</li>
+      <li>Obrázek se nikam neukládá, jen se pošle AI k přečtení. V prohlížeči si pamatuju jen výsledky posledních vyhodnocení.</li>
+    </ul></div></div>
+    <div class="tkgrid">
+      <div class="card">
+        <div class="drop" id="tkdrop"><b style="font-size:17px">Nahrát screenshot tiketu</b><p class="help">klepni / přetáhni sem / Ctrl+V</p><div id="tkprev"></div></div>
+        <input type="file" id="tkfile" accept="image/*" style="display:none">
+        <p class="help" style="margin-top:14px">…nebo vlož text tiketu (zkopírovaný z webu Tipsportu):</p>
+        <textarea id="tktext" rows="4" style="width:100%;background:rgba(255,255,255,.05);color:var(--text);border:1px solid var(--line2);border-radius:10px;padding:10px;font:inherit" placeholder="např. Edmonton - Vegas, Vítěz zápasu: Edmonton 1.99&#10;McDavid Connor - kanadský bod: ano 1.45"></textarea>
+        <button class="btn primary" id="tkgo" style="width:100%;margin-top:12px;font-size:16px;padding:13px">Vyhodnotit tiket</button>
+        ${hist.length ? `<h3 style="margin:22px 0 8px;font-size:15px">Poslední vyhodnocení</h3><div class="tkhist">${hist.map((h, i) => `<div class="card h" data-i="${i}" style="padding:12px">
+          <b>${esc(h.title)}</b><br><small class="muted">${esc(h.when)} · ${h.legs} sázek · kurz ${h.odds ?? "–"}</small><br><span class="${h.status === "won" ? "okc" : h.status === "lost" ? "noc" : "muted"}">${h.status === "won" ? "✅ vyhrál" : h.status === "lost" ? "❌ prohrál" : "⏳ otevřený"}</span></div>`).join("")}</div>` : ""}
+      </div>
+      <div id="tkres"><div class="card" style="min-height:260px;display:grid;place-items:center;text-align:center"><div><div class="display" style="font-size:42px;color:#fff">Čekám na tiket</div><p class="help">Výsledek vyhodnocení se ukáže tady.</p></div></div></div>
+    </div>`;
+  const drop = $("tkdrop"), file = $("tkfile");
+  drop.onclick = () => file.click();
+  file.onchange = () => file.files[0] && loadTkImage(file.files[0]);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; if (f) loadTkImage(f); };
+  $("tkgo").onclick = sendTicket;
+  el.querySelectorAll(".tkhist .h").forEach((c) => (c.onclick = () => { const h = tkHistory()[+c.dataset.i]; if (h?.data) renderTicket(h.data); }));
+  if (TK.img) $("tkprev").innerHTML = `<img src="${TK.img}" alt="">`;
+}
+document.addEventListener("paste", (e) => {
+  if (location.hash !== "#tikety") return;
+  const it = [...(e.clipboardData?.items || [])].find((x) => x.type.startsWith("image/"));
+  if (it) { e.preventDefault(); loadTkImage(it.getAsFile()); }
+});
+function loadTkImage(f) {
+  const img = new Image(), url = URL.createObjectURL(f);
+  img.onload = () => {
+    const k = Math.min(1, 1800 / Math.max(img.width, img.height));
+    const c = document.createElement("canvas"); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    TK.img = c.toDataURL("image/jpeg", 0.88);
+    $("tkprev").innerHTML = `<img src="${TK.img}" alt="">`;
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+async function sendTicket() {
+  const text = $("tktext").value.trim();
+  if (!TK.img && !text) { $("tkres").innerHTML = `<div class="card"><p class="err">Nahraj screenshot tiketu nebo vlož jeho text.</p></div>`; return; }
+  if (TK.busy) return;
+  TK.busy = true; $("tkgo").disabled = true; $("tkgo").textContent = "Vyhodnocuji…";
+  $("tkres").innerHTML = `<div class="card loader"><div class="spinner"></div><b>AI čte tiket a model počítá sázky…</b><p class="help">Trvá to 10–30 vteřin.</p></div>`;
+  try {
+    const r = await fetch("/model/ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: TK.img, text }) });
+    const j = await r.json();
+    if (!j.legs) throw new Error(j.error || "Vyhodnocení se nepovedlo.");
+    renderTicket(j);
+    const hist = tkHistory();
+    hist.unshift({ when: new Date().toLocaleString("cs-CZ", { day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit" }),
+      title: j.legs.map((x) => x.home && x.away ? `${x.home}–${x.away}` : "?").filter((v, i, a) => a.indexOf(v) === i).slice(0, 2).join(", "),
+      legs: j.legs.length, odds: j.summary.totalOdds ? (+j.summary.totalOdds).toFixed(2) : null, status: j.summary.status, data: j });
+    store.set("tk_hist", JSON.stringify(hist.slice(0, 8)));
+  } catch (e) {
+    $("tkres").innerHTML = `<div class="card"><p class="err">${esc(e.message)}</p></div>`;
+  }
+  TK.busy = false; $("tkgo").disabled = false; $("tkgo").textContent = "Vyhodnotit tiket";
+}
+function renderTicket(j) {
+  TK.last = j;
+  const S = j.summary;
+  const evTxt = S.ev == null ? null : S.ev;
+  const verdict = S.status === "won" ? ["good", "✅ Tiket vyšel"] : S.status === "lost" ? ["bad", "❌ Tiket nevyšel"]
+    : evTxt == null ? ["mid", "Nelze plně spočítat"] : evTxt > 0.03 ? ["good", "Model vidí hodnotu"] : evTxt > -0.1 ? ["mid", "Zhruba férový tiket"] : ["bad", "Podle modelu nevýhodný"];
+  $("tkres").innerHTML = `
+    <div class="card">
+      <span class="verdict ${verdict[0]}">${verdict[1]}</span>
+      <div class="simstats" style="margin-top:14px">
+        <div><small>Celkový kurz</small><b>${S.totalOdds ? (+S.totalOdds).toFixed(2) : "–"}</b></div>
+        <div><small>Šance podle modelu</small><b style="color:var(--cyan)">${S.pAll != null ? (S.pAll * 100).toFixed(S.pAll < 0.1 ? 1 : 0) + " %" : "–"}</b></div>
+        <div><small>Férový kurz</small><b>${S.pAll ? (1 / S.pAll).toFixed(2) : "–"}</b></div>
+        <div><small>Hodnota tiketu</small><b>${S.ev != null ? evHtml(S.pAll, S.totalOdds) : "–"}</b></div>
+        ${S.stake ? `<div><small>Vklad</small><b>${S.stake} Kč</b></div>` : ""}${S.possibleWin ? `<div><small>Možná výhra</small><b>${S.possibleWin} Kč</b></div>` : ""}
+      </div>
+      <p class="help"><b>Šance podle modelu</b> = jak pravděpodobné je, že vyjdou všechny sázky najednou. <b>Hodnota</b> kladná = kurz je vyšší, než by podle modelu měl být.</p>
+    </div>
+    <div class="tablewrap" style="margin-top:14px"><table class="t tkleg"><thead><tr><th class="left">Zápas</th><th class="left">Sázka</th><th>Kurz</th><th>Model</th><th>Férový</th><th>Hodnota</th><th>Výsledek</th></tr></thead><tbody>
+      ${j.legs.map((x) => { const L = x.leg; return `<tr>
+        <td class="left"><b>${x.gameId ? `<a href="#zapas-${x.gameId}">${esc(x.home)} – ${esc(x.away)}</a>` : esc(L.match || "?")}</b><small>${esc(L.match || "")}${x.date ? " · " + fmtDate(x.date) : ""}</small></td>
+        <td class="left"><b>${esc(L.selection || "")}</b><small>${esc(L.market || "")}${x.note && x.note !== KINDCZ[L.kind] && x.note !== "vítěz vč. prodloužení" ? " · " + esc(x.note) : ""}</small>
+          ${x.warn ? `<small style="color:var(--red)">🩹 ${esc(x.warn)}</small>` : ""}</td>
+        <td>${L.odds ? (+L.odds).toFixed(2) : "–"}</td><td class="gold">${x.prob != null ? pc(x.prob) : "–"}</td><td>${x.fair ?? "–"}</td>
+        <td>${x.prob != null && L.odds ? evHtml(x.prob, +L.odds) : "–"}</td>
+        <td>${x.result === true ? "✅" : x.result === false ? "❌" : "⏳"}${x.finalScore ? `<small>${esc(x.finalScore)}</small>` : ""}</td></tr>`; }).join("")}
+    </tbody></table></div>
+    <div class="card" style="margin-top:14px"><b>🤖 Komentář AI</b><div class="help" style="margin-top:8px;font-size:15px;color:var(--text)">${j.comment ? md(j.comment) : esc(j.commentError || "Komentář se nepodařilo vytvořit.")}</div></div>
+    ${j.suggestions?.length ? `<div class="card" style="margin-top:14px"><b>💡 Silné sázky z modelu ve stejných zápasech</b>
+      <p class="help" style="margin:4px 0 8px">Pokud chceš tiket upravit, tohle jsou sázky, kterým model v těchto zápasech věří nejvíc. Porovnej jejich férový kurz s Tipsportem – vyplatí se jen tehdy, když je kurz u Tipsportu <b>vyšší</b> než férový.</p>
+      ${j.suggestions.map((g) => `<div class="gk"><span><b>${esc(g.text)}</b><br><small class="muted">${esc(g.game)}</small></span><span style="text-align:right"><b style="color:var(--cyan)">${pc(g.prob)}</b><br><small class="muted">férový kurz ${fair(g.prob)}${g.odds ? " · Tipsport " + g.odds : ""}</small></span></div>`).join("")}</div>` : ""}
+    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap"><button class="btn" id="tkslip">Přenést do „Můj tiket“</button><button class="btn" id="tkai">Zeptat se AI na tento tiket</button></div>
+    <p class="disc">Model je odhad, ne jistota. Sázky ze stejného zápasu spolu souvisí, takže šance celého tiketu je jen přibližná. Sázej jen to, co si můžeš dovolit prohrát.</p>`;
+  $("tkslip").onclick = () => {
+    j.legs.forEach((x, i) => { if (x.prob == null) return; SLIP.items = SLIP.items.filter((s) => s.key !== "tk" + i);
+      SLIP.items.push({ key: "tk" + i + ":" + (x.gameId || ""), label: `${x.leg.selection} (${x.leg.market || ""})`, p: x.prob, odd: x.leg.odds ? +x.leg.odds : null, gid: x.gameId, match: `${x.home || "?"} – ${x.away || "?"}` }); });
+    saveSlip(); renderSlip(); $("slipbtn").click();
+  };
+  $("tkai").onclick = () => { openChat(); sendChat("Mám tento tiket z Tipsportu: " + j.legs.map((x) => `${x.home}–${x.away}: ${x.leg.market} ${x.leg.selection} @ ${x.leg.odds}`).join("; ") + ". Co si o něm myslíš a jak bys ho vylepšil?"); };
 }
 
 // ===================================================================
