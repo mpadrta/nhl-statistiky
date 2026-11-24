@@ -283,8 +283,14 @@ class League:
             self.backtest = self.run_backtest(pens)
         except Exception as e:
             print("Zpětný test selhal:", e, flush=True)
+        try:
+            SCOUT.update(list(self.games), st)
+            SCOUT.adjust_predictions(self.preds)
+            threading.Thread(target=scout_prewarm, daemon=True).start()
+        except Exception as e:
+            print("Rozbor akcí selhal:", e, flush=True)
         st.update(phase="Hotovo", done=st["total"])
-        print(f"Data obnovena: {len(self.games)} zápasů, {len(preds)} předpovědí", flush=True)
+        print(f"Data obnovena: {len(self.games)} zápasů, {len(preds)} předpovědí, rozbor {len(SCOUT.games)} zápasů", flush=True)
 
     def _load_penalties(self):
         pens, ids = {}, set()
@@ -1017,6 +1023,380 @@ def player_log(team, pid):
 
 
 # ---------------------------------------------------------------------------
+#  ROZBOR ZÁPASŮ „akce po akci“ – každá střela a gól celé sezóny
+#  (místo na ledě, typ střely, přesilovka, dorážka, protiútok, brankář)
+# ---------------------------------------------------------------------------
+ZONES = ("crease", "slot", "high", "circles", "point", "behind")
+ZONE_CZ = {"crease": "těsně před brankou", "slot": "slot", "high": "vysoký slot", "circles": "z kruhů (z boku)",
+           "point": "od modré čáry", "behind": "zpoza branky"}
+SHOT_CZ = {"wrist": "zápěstím", "snap": "švihem", "slap": "golfákem", "backhand": "bekhendem", "tip-in": "tečí",
+           "deflected": "tečí/odrazem", "wrap-around": "zpoza branky (objížďka)", "poke": "šťouchnutím", "bat": "z voleje",
+           "cradle": "lakros", "between-legs": "mezi nohama"}
+
+
+def _zone(x, y):
+    if x > 89:
+        return "behind"
+    if math.hypot(89 - x, y) <= 12:
+        return "crease"
+    if x >= 69 and abs(y) <= 14:
+        return "slot"
+    if x >= 54 and abs(y) <= 14:
+        return "high"
+    if x >= 54:
+        return "circles"
+    return "point"
+
+
+def _tsec(per, t):
+    try:
+        m, s = (t or "0:0").split(":")
+        return (per - 1) * 1200 + int(m) * 60 + int(s)
+    except Exception:
+        return 0
+
+
+def parse_pbp(d):
+    """Z play-by-play udělá kompaktní seznam střeleckých pokusů s kontextem."""
+    ht, at = d.get("homeTeam") or {}, d.get("awayTeam") or {}
+    hid = ht.get("id")
+    ab = {hid: ht.get("abbrev"), at.get("id"): at.get("abbrev")}
+    names = {}
+    for r in d.get("rosterSpots") or []:
+        names[r.get("playerId")] = (f"{_abbr(r.get('firstName')) or ''} {_abbr(r.get('lastName')) or ''}".strip(),
+                                     ab.get(r.get("teamId")), r.get("sweaterNumber"), r.get("positionCode"))
+    shots, prev = [], []
+    for p in d.get("plays") or []:
+        pd = p.get("periodDescriptor") or {}
+        if pd.get("periodType") == "SO":
+            continue
+        per = pd.get("number") or 1
+        t = p.get("typeDescKey")
+        det = p.get("details") or {}
+        sec = _tsec(per, p.get("timeInPeriod"))
+        owner = det.get("eventOwnerTeamId")
+        if t in ("shot-on-goal", "goal", "missed-shot") and det.get("xCoord") is not None and owner:
+            x, y = det.get("xCoord"), det.get("yCoord") or 0
+            is_home = owner == hid
+            side = p.get("homeTeamDefendingSide")
+            if (is_home and side == "right") or (not is_home and side == "left"):
+                x, y = -x, -y
+            if x < 0 and (det.get("zoneCode") == "O"):  # pojistka proti chybné straně
+                x, y = -x, -y
+            sit = p.get("situationCode") or "1551"
+            try:
+                ag, as_, hs, hg = int(sit[0]), int(sit[1]), int(sit[2]), int(sit[3])
+            except Exception:
+                ag, as_, hs, hg = 1, 5, 5, 1
+            own, opp, opp_g = (hs, as_, ag) if is_home else (as_, hs, hg)
+            strength = "EN" if opp_g == 0 else "PP" if own > opp else "SH" if own < opp else "EV"
+            recent = [e for e in prev if 0 <= sec - e[0] <= 6]
+            rebound = any(e[1] in ("shot-on-goal", "missed-shot", "blocked-shot") and e[2] == owner and sec - e[0] <= 3 for e in recent)
+            rush = any(((e[2] == owner and e[3] in ("N", "D")) or (e[2] != owner and e[3] in ("N", "O"))) and sec - e[0] <= 5
+                       for e in recent if e[1] not in ("faceoff",))
+            fo = any(e[1] == "faceoff" and e[2] == owner and sec - e[0] <= 5 for e in recent)
+            goal = t == "goal"
+            shots.append({
+                "t": ab.get(owner), "p": det.get("scoringPlayerId") if goal else det.get("shootingPlayerId"),
+                "gk": det.get("goalieInNetId"), "x": x, "y": y, "z": _zone(x, y), "st": det.get("shotType") or "?",
+                "s": strength, "gl": 1 if goal else 0, "on": 1 if t != "missed-shot" else 0, "rb": int(rebound), "ru": int(rush and not rebound),
+                "fo": int(fo), "per": per, "sec": sec,
+                "a": [x_ for x_ in (det.get("assist1PlayerId"), det.get("assist2PlayerId")) if x_] if goal else [],
+            })
+        if t not in ("stoppage", "period-start", "period-end", "game-end", "delayed-penalty"):
+            prev.append((sec, t, owner, det.get("zoneCode")))
+            prev = prev[-12:]
+    return {"home": ab.get(hid), "away": ab.get(at.get("id")), "date": (d.get("gameDate") or "")[:10], "shots": shots, "names": names}
+
+
+class Scout:
+    def __init__(self):
+        self.games = {}   # gid -> parse_pbp
+        self.names = {}   # pid -> (jméno, tým, číslo, pozice)
+        self.players, self.teams, self.goalies, self.lg = {}, {}, {}, {}
+        self.ready = False
+        self.updated = 0
+        self.previews = {}  # gid -> (čas, text)
+
+    def update(self, game_ids, state=None):
+        todo = [g for g in game_ids if g not in self.games]
+
+        def load(gid):
+            try:
+                d = json.loads(http_get(NHL_API + f"gamecenter/{gid}/play-by-play"))
+                if d.get("gameState") in ("FINAL", "OFF"):
+                    self.games[gid] = parse_pbp(d)
+            except Exception:
+                pass
+            if state is not None:
+                state["done"] += 1
+
+        if state is not None:
+            state.update(phase="Rozebírám záznamy zápasů akci po akci…", done=0, total=len(todo))
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(load, todo))
+        self.build()
+
+    def build(self):
+        P, T, G = {}, {}, {}
+        lgz = {z: [0, 0, 0] for z in ZONES}  # pokusy, na branku, góly (celá liga)
+        names = {}
+        order = sorted(self.games.items(), key=lambda kv: (kv[1]["date"], kv[0]))
+        for gid, g in order:
+            names.update(g["names"])
+            for side in ("home", "away"):
+                tm = T.setdefault(g[side], {"gp": 0, "for": {z: [0, 0, 0] for z in ZONES}, "against": {z: [0, 0, 0] for z in ZONES},
+                                            "ga": {"rb": 0, "ru": 0, "PP": 0, "fo": 0, "all": 0}, "gf": {"rb": 0, "ru": 0, "PP": 0, "fo": 0, "all": 0},
+                                            "gaTypes": {}, "per": {}})
+                tm["gp"] += 1
+            seen_players = set()
+            for s in g["shots"]:
+                if s["s"] == "EN":
+                    continue
+                team, opp = s["t"], g["away"] if s["t"] == g["home"] else g["home"]
+                z = s["z"]
+                for arr in (lgz[z], T[team]["for"][z], T[opp]["against"][z]):
+                    arr[0] += 1; arr[1] += s["on"]; arr[2] += s["gl"]
+                if s["gl"]:
+                    for key, tm in (("gf", T[team]), ("ga", T[opp])):
+                        tm[key]["all"] += 1
+                        tm[key]["rb"] += s["rb"]; tm[key]["ru"] += s["ru"]; tm[key]["fo"] += s["fo"]
+                        tm[key]["PP"] += 1 if s["s"] == "PP" else 0
+                    T[opp]["gaTypes"][s["st"]] = T[opp]["gaTypes"].get(s["st"], 0) + 1
+                    pr = min(s["per"], 4)
+                    T[opp]["per"][pr] = T[opp]["per"].get(pr, 0) + 1
+                if s["gk"] and s["on"]:
+                    gk = G.setdefault(s["gk"], {"sa": 0, "ga": 0, "zones": {z_: [0, 0] for z_ in ZONES}, "types": {}})
+                    gk["sa"] += 1; gk["ga"] += s["gl"]
+                    gk["zones"][z][0] += 1; gk["zones"][z][1] += s["gl"]
+                    ty = gk["types"].setdefault(s["st"], [0, 0]); ty[0] += 1; ty[1] += s["gl"]
+                pid = s["p"]
+                if not pid:
+                    continue
+                pl = P.setdefault(pid, {"att": 0, "sog": 0, "g": 0, "zones": {z_: [0, 0, 0] for z_ in ZONES}, "types": {}, "str": {},
+                                        "rb": 0, "ru": 0, "fo": 0, "dist": 0.0, "gmap": [], "smap": [], "log": {}, "per": {}})
+                pl["att"] += 1; pl["sog"] += s["on"]; pl["g"] += s["gl"]
+                zz = pl["zones"][z]; zz[0] += 1; zz[1] += s["on"]; zz[2] += s["gl"]
+                ty = pl["types"].setdefault(s["st"], [0, 0]); ty[0] += s["on"]; ty[1] += s["gl"]
+                lg_ = pl["log"].setdefault(gid, [g["date"], 0, 0, opp]); lg_[1] += s["on"]; lg_[2] += s["gl"]
+                pl["smap"].append([round(s["x"]), round(s["y"]), s["gl"]])
+                if s["gl"]:
+                    pl["str"][s["s"]] = pl["str"].get(s["s"], 0) + 1
+                    pl["rb"] += s["rb"]; pl["ru"] += s["ru"]; pl["fo"] += s["fo"]
+                    pl["dist"] += math.hypot(89 - s["x"], s["y"])
+                    pl["gmap"].append([round(s["x"]), round(s["y"]), s["st"], s["s"], g["date"], opp])
+                    pr = min(s["per"], 4)
+                    pl["per"][pr] = pl["per"].get(pr, 0) + 1
+        for pid, pl in P.items():
+            pl["smap"] = pl["smap"][-120:]
+            pl["gmap"] = pl["gmap"][-60:]
+            n = names.get(pid)
+            pl["name"], pl["team"], pl["num"], pl["pos"] = (n or ("?", None, None, None))
+        ngames = max(1, len(self.games))
+        lg = {"zones": {z: {"att": lgz[z][0] / (2 * ngames), "sog": lgz[z][1] / (2 * ngames), "g": lgz[z][2] / (2 * ngames),
+                            "sh": lgz[z][2] / max(1, lgz[z][1])} for z in ZONES}, "games": len(self.games)}
+        with LEAGUE.lock:
+            self.players, self.teams, self.goalies, self.lg, self.names = P, T, G, lg, names
+            self.ready = bool(self.games)
+            self.updated = time.time()
+
+    # --- pomocné výpočty ---------------------------------------------------
+    def team_def(self, ab):
+        """Jak tým brání podle zón: kolik střel na branku a gólů pouští oproti průměru ligy (1.0 = průměr)."""
+        tm = self.teams.get(ab)
+        if not tm or not self.lg:
+            return None
+        out = {}
+        for z in ZONES:
+            L = self.lg["zones"][z]
+            a = tm["against"][z]
+            k = 8
+            sog = (a[1] + L["sog"] * k) / (tm["gp"] + k)
+            gl = (a[2] + L["g"] * k) / (tm["gp"] + k)
+            out[z] = {"sogPg": round(a[1] / max(1, tm["gp"]), 2), "gPg": round(a[2] / max(1, tm["gp"]), 2),
+                      "sogIdx": round(sog / max(0.01, L["sog"]), 2), "gIdx": round(gl / max(0.005, L["g"]), 2)}
+        return out
+
+    def goalie_idx(self, gk_id):
+        gk = self.goalies.get(gk_id)
+        if not gk or not self.lg:
+            return None
+        out = {}
+        for z in ZONES:
+            L = self.lg["zones"][z]["sh"]
+            sa, ga = gk["zones"][z]
+            k = 25
+            rate = (ga + L * k) / (sa + k)
+            out[z] = {"sa": sa, "ga": ga, "svp": round(1 - ga / sa, 3) if sa else None, "idx": round(rate / max(0.005, L), 2)}
+        return {"sa": gk["sa"], "ga": gk["ga"], "svp": round(1 - gk["ga"] / gk["sa"], 3) if gk["sa"] else None, "zones": out}
+
+    def player_profile(self, pid):
+        pl = self.players.get(pid)
+        if not pl:
+            return None
+        g = max(1, pl["g"])
+        zones = []
+        for z in ZONES:
+            a, on, gl = pl["zones"][z]
+            if a:
+                zones.append({"z": z, "label": ZONE_CZ[z], "att": a, "sog": on, "g": gl, "shareG": round(gl / g, 3) if pl["g"] else 0,
+                              "shareA": round(a / max(1, pl["att"]), 3), "sh": round(gl / on, 3) if on else None})
+        zones.sort(key=lambda x: (-x["g"], -x["att"]))
+        types = sorted(({"type": k, "label": SHOT_CZ.get(k, k), "sog": v[0], "g": v[1]} for k, v in pl["types"].items() if k != "?"), key=lambda x: (-x["g"], -x["sog"]))
+        log = sorted(pl["log"].values())[-10:]
+        return {"id": pid, "name": pl["name"], "team": pl["team"], "num": pl["num"], "pos": pl["pos"],
+                "att": pl["att"], "sog": pl["sog"], "g": pl["g"], "shPct": round(pl["g"] / pl["sog"], 3) if pl["sog"] else None,
+                "avgGoalDist": round(pl["dist"] / pl["g"], 1) if pl["g"] else None,
+                "zones": zones, "types": types[:6], "strength": pl["str"], "rebound": pl["rb"], "rush": pl["ru"], "faceoff": pl["fo"],
+                "periods": pl["per"], "goals": pl["gmap"], "shots": pl["smap"],
+                "last10": [{"date": d, "sog": s, "g": gl, "opp": o} for d, s, gl, o in log]}
+
+    def matchup_factor(self, pid, opp, gk_id):
+        """Odhad, jak moc soupeř (obrana + brankář) sedí stylu hráče. 1.0 = neutrální."""
+        pl = self.players.get(pid)
+        dfn = self.team_def(opp)
+        if not pl or not dfn or pl["sog"] < 8:
+            return 1.0, []
+        gki = self.goalie_idx(gk_id) if gk_id else None
+        w_tot, f = 0.0, 0.0
+        for z in ZONES:
+            a, on, gl = pl["zones"][z]
+            w = on + 3 * gl
+            if not w:
+                continue
+            idx = dfn[z]["sogIdx"] ** 0.5 * dfn[z]["gIdx"] ** 0.25
+            if gki:
+                idx *= gki["zones"][z]["idx"] ** 0.5
+            f += w * idx
+            w_tot += w
+        if not w_tot:
+            return 1.0, []
+        fac = _clamp(f / w_tot, 0.85, 1.15)
+        top = max(ZONES, key=lambda z: pl["zones"][z][2] * 3 + pl["zones"][z][1])
+        si = dfn[top]["sogIdx"]
+        notes = [f"nejčastěji střílí/skóruje {ZONE_CZ[top]}; {opp} odtud pouští "
+                 + ("víc střel, než je průměr ligy" if si > 1.05 else "méně střel, než je průměr ligy" if si < 0.95 else "zhruba průměrně střel")
+                 + f" ({round((si - 1) * 100):+d} %)"]
+        if gki:
+            gz = gki["zones"][top]
+            if gz["sa"] >= 15 and gz["svp"] is not None:
+                notes.append(f"brankář soupeře chytá střely z této zóny na {gz['svp'] * 100:.1f} % ({gz['ga']} gólů z {gz['sa']})")
+        return round(fac, 3), notes
+
+    def game_report(self, pred):
+        if not self.ready or not pred:
+            return None
+        H, A = pred["home"], pred["away"]
+        def starter(side):
+            lst = ((pred.get("teams") or {}).get(H if side == "home" else A) or {}).get("goalies") or []
+            return next((x for x in lst if x.get("likely")), None) or (lst[0] if lst else None)
+        res = {"home": H, "away": A, "games": self.lg.get("games"), "teams": {}, "players": []}
+        for side, team, opp in (("home", H, A), ("away", A, H)):
+            tm = self.teams.get(team)
+            if not tm:
+                continue
+            gf, ga = tm["gf"], tm["ga"]
+            st_opp = starter("away" if side == "home" else "home")
+            res["teams"][team] = {
+                "gp": tm["gp"], "defense": self.team_def(team),
+                "gf": gf, "ga": ga, "gaTypes": sorted(([SHOT_CZ.get(k, k), v] for k, v in tm["gaTypes"].items()), key=lambda x: -x[1])[:5],
+                "gaPer": tm["per"],
+                "for": {z: tm["for"][z] for z in ZONES},
+                "oppGoalie": st_opp and {"id": st_opp.get("id"), "name": st_opp.get("name"), "zones": self.goalie_idx(st_opp.get("id"))},
+            }
+        for pl in [x for x in pred.get("players", []) if x.get("active")][:16]:
+            opp = A if pl["team"] == H else H
+            st_opp = starter("away" if pl["team"] == H else "home")
+            fac, notes = self.matchup_factor(pl["id"], opp, st_opp and st_opp.get("id"))
+            prof = self.player_profile(pl["id"])
+            if not prof:
+                continue
+            res["players"].append({"id": pl["id"], "name": pl["name"], "team": pl["team"], "num": pl.get("num"), "pGoal": pl["pGoal"], "pPoint": pl["pPoint"],
+                                   "factor": fac, "notes": notes, "profile": {k: prof[k] for k in ("g", "sog", "shPct", "avgGoalDist", "zones", "types", "strength", "rebound", "rush", "faceoff", "goals", "last10")}})
+        res["players"].sort(key=lambda x: -(x["pGoal"] * x["factor"]))
+        return res
+
+    def adjust_predictions(self, preds):
+        """Jemně upraví šanci na gól/bod podle toho, jak styl hráče sedí na soupeře (max ±15 % gólu, ±6 % bodu)."""
+        if not self.ready:
+            return
+        for p in preds.values():
+            if p.get("scoutAdj"):
+                continue
+            H, A = p["home"], p["away"]
+            for pl in p.get("players", []):
+                opp = A if pl["team"] == H else H
+                lst = ((p.get("teams") or {}).get(opp) or {}).get("goalies") or []
+                gk = next((x for x in lst if x.get("likely")), None)
+                fac, notes = self.matchup_factor(pl["id"], opp, gk and gk.get("id"))
+                if fac != 1.0:
+                    pl["pGoal"] = round(_clamp(pl["pGoal"] * fac, 0.01, 0.9), 4)
+                    pl["pPoint"] = round(_clamp(pl["pPoint"] * (1 + (fac - 1) * 0.4), 0.01, 0.97), 4)
+                pl["scout"] = {"factor": fac, "notes": notes}
+            p["scoutAdj"] = True
+
+
+SCOUT = Scout()
+
+
+def scout_preview(gid, force=False):
+    """AI preview zápasu napsaný z rozboru akcí (cache 6 h)."""
+    hit = SCOUT.previews.get(gid)
+    if hit and not force and time.time() - hit[0] < 6 * 3600:
+        return {"text": hit[1], "cached": True}
+    pred = LEAGUE.preds.get(gid)
+    rep = SCOUT.game_report(pred)
+    if not rep:
+        return {"error": "Rozbor zápasů se ještě počítá, zkus to za pár minut."}
+    lines = [f"Zápas {rep['home']} (doma) – {rep['away']} (venku). Rozbor z {rep['games']} odehraných zápasů sezóny, akce po akci."]
+    lines.append(f"Model: výhra {rep['home']} {round(pred['win']['home'] * 100)} %, góly {pred['goals']['total']:.1f}, střely {pred['shots']['total']['exp']:.1f}.")
+    for t, d in rep["teams"].items():
+        weak = sorted(d["defense"].items(), key=lambda kv: -kv[1]["sogIdx"])[:2]
+        strong = sorted(d["defense"].items(), key=lambda kv: kv[1]["sogIdx"])[:1]
+        lines.append(f"{t} obrana: nejvíc pouští {', '.join(f'{ZONE_CZ[z]} ({round((v['sogIdx'] - 1) * 100):+d} % vs liga)' for z, v in weak)}; "
+                     f"nejlíp brání {ZONE_CZ[strong[0][0]]}. Inkasované góly: {d['ga']['all']} (z toho dorážky {d['ga']['rb']}, protiútoky {d['ga']['ru']}, přesilovky {d['ga']['PP']}). "
+                     f"Nejčastěji inkasuje střelou {', '.join(f'{a} ({b})' for a, b in d['gaTypes'][:3])}. Góly vstřelené: {d['gf']['all']} (dorážky {d['gf']['rb']}, protiútoky {d['gf']['ru']}, přesilovky {d['gf']['PP']}).")
+        og = d.get("oppGoalie")
+        if og and og.get("zones"):
+            z = og["zones"]
+            lines.append(f"Brankář proti {t}: {og['name']}, úspěšnost {z['svp']}; podle zón: "
+                         + ", ".join(f"{ZONE_CZ[k]} {v['svp']}" for k, v in z["zones"].items() if v["sa"] >= 20))
+    for p in rep["players"][:8]:
+        pr = p["profile"]
+        zs = ", ".join(f"{z['label']} {z['g']} g" for z in pr["zones"][:3] if z["g"])
+        ts = ", ".join(f"{t['label']} {t['g']} g" for t in pr["types"][:3] if t["g"])
+        lines.append(f"{p['name']} ({p['team']}): {pr['g']} gólů z {pr['sog']} střel na branku; góly: {zs or '–'}; typy: {ts or '–'}; "
+                     f"dorážky {pr['rebound']}, protiútoky {pr['rush']}, přesilovky {pr['strength'].get('PP', 0)}; "
+                     f"posledních 10 z.: {sum(x['g'] for x in pr['last10'])} g/{sum(x['sog'] for x in pr['last10'])} střel; "
+                     f"šance na gól {round(p['pGoal'] * 100)} % (úprava podle soupeře ×{p['factor']}); {'; '.join(p['notes'])}")
+    r = gemini_generate([{"role": "user", "parts": [{"text": "\n".join(lines)}]}],
+                        "Jsi hokejový analytik a skaut. Z dat akce po akci napiš česky rozbor nadcházejícího zápasu (cca 200–260 slov): "
+                        "1) jak bude zápas nejspíš vypadat (tempo, kdo bude tlačit), 2) kde má každý tým slabinu v obraně a kdo ji umí využít, "
+                        "3) 3 hráči, od kterých čekat gól, a JAK ho nejspíš dají (odkud, jakou střelou, dorážka/přesilovka), 4) jeden tip na zajímavou sázku z dat. "
+                        "Piš srozumitelně pro laika, používej odrážky a tučné písmo, čísla ber jen z dat. Na konci krátce: je to odhad z dat, ne jistota.",
+                        temperature=0.5, max_tokens=4096)
+    if "text" in r:
+        SCOUT.previews[gid] = (time.time(), r["text"])
+        return {"text": r["text"]}
+    return {"error": r.get("error")}
+
+
+def scout_prewarm():
+    """Na pozadí předpřipraví AI rozbory dnešních a zítřejších zápasů (pomalu, aby se nevyčerpal limit AI)."""
+    if not gemini_key():
+        return
+    for gid in list(LEAGUE.preds)[:16]:
+        hit = SCOUT.previews.get(gid)
+        if hit and time.time() - hit[0] < 6 * 3600:
+            continue
+        try:
+            scout_preview(gid)
+        except Exception as e:
+            print("prewarm", gid, e, flush=True)
+        time.sleep(20)
+
+
+# ---------------------------------------------------------------------------
 #  LIVE zápasy
 # ---------------------------------------------------------------------------
 _live_cache = {}
@@ -1332,6 +1712,21 @@ def chat_context(gid=None):
             lines.append(f"  {pl['name']} {pl['team']} {pl['pos']}: bod {_p(pl['pPoint'])} (fér. kurz {_fair(pl['pPoint'])}), "
                          f"gól {_p(pl['pGoal'])}, 2+ body {_p(pl.get('p2Points', 0))}, první gól {_p(pl.get('pFirstGoal', 0))}, střely {pl['expShots']} (2+ {_p(pl['p2Shots'])}, 3+ {_p(pl['p3Shots'])}), "
                          f"forma {pl['form5']} b., série {pl['streak']}, sezóna {pl['g']}+{pl['a']}={pl['pts']} v {pl['gp']} z.")
+    try:
+        if gid and SCOUT.ready and gid in LEAGUE.preds:
+            rep = SCOUT.game_report(LEAGUE.preds[gid])
+            if rep:
+                lines.append("ROZBOR AKCE PO AKCI (všechny zápasy sezóny):")
+                for t, d in rep["teams"].items():
+                    weak = sorted(d["defense"].items(), key=lambda kv: -kv[1]["sogIdx"])[:2]
+                    lines.append(f"  {t} obrana pouští nejvíc: " + ", ".join(f"{ZONE_CZ[z]} {round((v['sogIdx'] - 1) * 100):+d} %" for z, v in weak)
+                                 + f"; inkasované góly {d['ga']['all']} (dorážky {d['ga']['rb']}, protiútoky {d['ga']['ru']}, oslabení {d['ga']['PP']})")
+                for pp in rep["players"][:8]:
+                    pr = pp["profile"]
+                    lines.append(f"  {pp['name']}: {pr['g']} g; góly " + ", ".join(f"{z['label']} {z['g']}" for z in pr["zones"] if z["g"])
+                                 + f"; dorážky {pr['rebound']}, protiútoky {pr['rush']}; sedí na soupeře ×{pp['factor']}")
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -1407,6 +1802,33 @@ def goal_ai(gid, eid):
     return res
 
 
+def _thinking_cfg(model, level):
+    """Méně přemýšlení = rychlejší odpověď. Gemini 3.x zná thinkingLevel, 2.5 thinkingBudget."""
+    m = model.lower()
+    if not level:
+        return None
+    if re.search(r"gemini-(3|[4-9])", m):
+        return {"thinkingLevel": "minimal" if level == "minimal" and "flash" in m else "low"}
+    if "2.5" in m:
+        return {"thinkingBudget": 0 if level == "minimal" else 1024}
+    return None
+
+
+def _gem_call(model, key, payload, timeout, level):
+    """Zavolá model s omezeným přemýšlením; když ho model nezná (400), zkusí to bez něj."""
+    url = f"{GEMINI_API}models/{model}:generateContent?key={urllib.parse.quote(key)}"
+    tc = _thinking_cfg(model, level)
+    if tc:
+        p = json.loads(json.dumps(payload))
+        p["generationConfig"]["thinkingConfig"] = tc
+        try:
+            return json.loads(http_get(url, data=json.dumps(p).encode(), headers={"Content-Type": "application/json"}, timeout=timeout))
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+    return json.loads(http_get(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, timeout=timeout))
+
+
 def chat(messages, gid=None, system_override=False):
     key = gemini_key()
     if not key:
@@ -1424,16 +1846,15 @@ def chat(messages, gid=None, system_override=False):
             contents.append({"role": role, "parts": [{"text": text}]})
     if not contents or contents[-1]["role"] != "user":
         return {"error": "Prázdná zpráva."}
-    body = json.dumps({
+    payload = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 8192},
-    }).encode()
+    }
     last_err = None
     for model in gemini_models(key)[:5]:
-        url = f"{GEMINI_API}models/{model}:generateContent?key={urllib.parse.quote(key)}"
         try:
-            d = json.loads(http_get(url, data=body, headers={"Content-Type": "application/json"}, timeout=60))
+            d = _gem_call(model, key, payload, 60, "low")
             cand = (d.get("candidates") or [{}])[0]
             text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", []) if not p.get("thought"))
             if text.strip():
@@ -1458,19 +1879,18 @@ def chat(messages, gid=None, system_override=False):
 # ---------------------------------------------------------------------------
 #  Tikety z Tipsportu – přečtení (AI), spárování se zápasy, vyhodnocení
 # ---------------------------------------------------------------------------
-def gemini_generate(contents, system, as_json=False, max_tokens=8192, temperature=0.3):
+def gemini_generate(contents, system, as_json=False, max_tokens=8192, temperature=0.3, level="low"):
     key = gemini_key()
     if not key:
         return {"error": "AI zatím není zapnutá – chybí klíč GEMINI_API_KEY."}
     cfg = {"temperature": temperature, "maxOutputTokens": max_tokens}
     if as_json:
         cfg["responseMimeType"] = "application/json"
-    body = json.dumps({"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg}).encode()
+    payload = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": cfg}
     last = None
-    for model in gemini_models(key)[:5]:
-        url = f"{GEMINI_API}models/{model}:generateContent?key={urllib.parse.quote(key)}"
+    for model in gemini_models(key)[:4]:
         try:
-            d = json.loads(http_get(url, data=body, headers={"Content-Type": "application/json"}, timeout=90))
+            d = _gem_call(model, key, payload, 75, level)
             cand = (d.get("candidates") or [{}])[0]
             text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", []) if not p.get("thought"))
             if text.strip():
@@ -1721,7 +2141,7 @@ def analyze_ticket(image_b64=None, mime="image/jpeg", text=None):
         parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
     if text:
         parts.append({"text": "Text tiketu:\n" + text[:4000]})
-    r = gemini_generate([{"role": "user", "parts": parts}], "Jsi přesný čtenář sázkových tiketů. Odpovídáš jen validním JSON.", as_json=True, temperature=0.1)
+    r = gemini_generate([{"role": "user", "parts": parts}], "Jsi přesný čtenář sázkových tiketů. Odpovídáš jen validním JSON.", as_json=True, temperature=0.1, level="minimal")
     if "error" in r:
         return r
     try:
@@ -1826,6 +2246,98 @@ def analyze_ticket(image_b64=None, mime="image/jpeg", text=None):
 
 
 # ---------------------------------------------------------------------------
+#  Kurzy z Tipsportu – uživatel nahraje screenshot nabídky, AI přečte kurzy, model spočítá hodnotu
+# ---------------------------------------------------------------------------
+TS_ODDS = {}  # gameId -> {"at": iso, "markets": [...]}  (v paměti serveru, sdílené mezi zařízeními do restartu)
+
+ODDS_SCHEMA = """Vrať POUZE JSON tohoto tvaru:
+{"games": [{"home": "domácí tým", "away": "hostující tým", "date": "YYYY-MM-DD" nebo null,
+  "markets": [{"market": "název sázky jak je na obrázku", "selection": "tip jak je na obrázku", "odds": číslo,
+     "kind": jedno z ["winner_ot","1x2","total_goals","team_goals","total_shots","team_shots","total_pens","total_pim","total_hits",
+              "player_point","player_goal","player_assist","player_2points","player_shots","first_goal_team","first_goal_player","pp_goal_team","other"],
+     "pick": jedno z ["home","away","1","0","2","10","02","12","over","under","yes","no"],
+     "line": číslo nebo null, "team": "home"|"away"|null, "player": "jméno hráče" nebo null}]}]}
+Je to výřez nabídky sázkové kanceláře Tipsport pro NHL. Vypiš KAŽDÝ kurz, který vidíš, jako samostatnou položku v markets
+(např. u zápasu s kurzy 1 / 0 / 2 / 10 / 02 jsou to 5 položek kind "1x2" s pick "1","0","2","10","02").
+Pokud je u celkového počtu gólů vidět „méně než“ i „více než“, jsou to 2 položky (pick under a over se stejnou line).
+""" + TICKET_SCHEMA.split("Pravidla:", 1)[1].replace("tiketu", "obrázku").replace("tiket", "obrázek")
+
+
+def analyze_odds(image_b64=None, mime="image/jpeg", text=None):
+    if not LEAGUE.ready:
+        return {"error": "Data se ještě načítají, zkus to za minutu."}
+    parts = [{"text": "Přečti kurzy z tohoto výřezu nabídky Tipsportu (NHL hokej) a převeď je do JSON. Pravidla: " + ODDS_SCHEMA}]
+    if image_b64:
+        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
+    if text:
+        parts.append({"text": "Text nabídky:\n" + text[:6000]})
+    r = gemini_generate([{"role": "user", "parts": parts}], "Jsi přesný čtenář kurzových nabídek. Odpovídáš jen validním JSON.",
+                        as_json=True, temperature=0.1, level="minimal")
+    if "error" in r:
+        return r
+    try:
+        raw = r["text"].strip()
+        data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+    except Exception:
+        return {"error": "AI kurzy nepřečetla. Zkus ostřejší screenshot (jen nabídka NHL, bez reklam)."}
+    idx = _team_index()
+    cands = [g for g in _candidate_games() if g["state"] not in ("OFF", "FINAL")]
+    out, missing = [], []
+    now = datetime.datetime.now(PRAGUE).isoformat(timespec="minutes")
+    for gm in (data.get("games") or [])[:20]:
+        H, A = _find_team(gm.get("home"), idx), _find_team(gm.get("away"), idx)
+        opts = [g for g in cands if {g["home"], g["away"]} == {H, A}] if H and A else []
+        if not opts:
+            missing.append(f"{gm.get('home')} – {gm.get('away')}")
+            continue
+        d = gm.get("date")
+        opts.sort(key=lambda g: (0 if d and g["date"] == d else 1, g["date"] or ""))
+        game = opts[0]
+        swap = game["home"] != H
+        pred = LEAGUE.preds.get(game["id"])
+        mk = []
+        for m in (gm.get("markets") or [])[:80]:
+            try:
+                odds = float(m.get("odds"))
+            except (TypeError, ValueError):
+                continue
+            if odds <= 1.0:
+                continue
+            if swap:
+                m["pick"] = {"home": "away", "away": "home", "1": "2", "2": "1", "10": "02", "02": "10"}.get(str(m.get("pick")), m.get("pick"))
+                if m.get("team") in ("home", "away"):
+                    m["team"] = "away" if m["team"] == "home" else "home"
+            item = {k: m.get(k) for k in ("market", "selection", "kind", "pick", "line", "team", "player")}
+            item["odds"] = odds
+            if pred:
+                try:
+                    prob, note, pl = _leg_probability(m, pred)
+                except Exception:
+                    prob, note, pl = None, None, None
+                if prob:
+                    item.update(prob=round(prob, 4), fair=round(1 / prob, 2) if prob > 0.01 else None, ev=round(prob * odds - 1, 4))
+                item["note"] = note
+                if pl:
+                    item["playerId"] = pl["id"]
+                    if pl.get("injury"):
+                        item["warn"] = f"{pl['name']}: {pl['injury']['status']}"
+            mk.append(item)
+        if not mk:
+            continue
+        old = (TS_ODDS.get(game["id"]) or {}).get("markets") or []
+        key = lambda x: (x.get("kind"), str(x.get("pick")), x.get("line"), x.get("team"), (x.get("player") or "").lower())
+        merged = {key(x): x for x in old}
+        merged.update({key(x): x for x in mk})
+        rec = {"at": now, "markets": sorted(merged.values(), key=lambda x: -(x.get("ev") if x.get("ev") is not None else -9))}
+        TS_ODDS[game["id"]] = rec
+        out.append({"gameId": game["id"], "home": game["home"], "away": game["away"], "date": game["date"], "start": game.get("start"), **rec})
+    if not out:
+        return {"error": "Na obrázku jsem nenašel kurzy k nadcházejícím zápasům NHL."
+                + (f" Přečetl jsem: {', '.join(missing[:4])}." if missing else "")}
+    return {"games": out, "missing": missing}
+
+
+# ---------------------------------------------------------------------------
 #  Webový server
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -1894,6 +2406,25 @@ class Handler(BaseHTTPRequestHandler):
             LEAGUE.ensure()
             self._send(200, b"ok", "text/plain")
             return
+        if u.path in ("/model/scout", "/model/scoutplayer"):
+            try:
+                xid = int(q.get("id", ["0"])[0])
+            except ValueError:
+                xid = 0
+            if not SCOUT.ready:
+                self._json({"loading": True, "error": "Rozbor zápasů akci po akci se ještě počítá (první spuštění trvá pár minut)."})
+                return
+            if u.path == "/model/scout":
+                pred = LEAGUE.preds.get(xid)
+                rep = SCOUT.game_report(pred) if pred else None
+                if rep:
+                    hit = SCOUT.previews.get(xid)
+                    rep["preview"] = hit[1] if hit else None
+                self._json(rep or {"error": "Rozbor je jen pro nadcházející zápasy."})
+            else:
+                prof = SCOUT.player_profile(xid)
+                self._json(prof or {"error": "Hráč zatím nemá v sezóně žádné střely."})
+            return
         if u.path == "/model/player":
             try:
                 pid = int(q.get("id", ["0"])[0])
@@ -1942,7 +2473,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print("retro selhalo", gid, e, flush=True)
             if p:
-                self._json(p)
+                ts = TS_ODDS.get(gid)
+                self._json({**p, "tipsport": ts} if ts else p)
             elif not LEAGUE.ready:
                 self._json({"loading": True, **LEAGUE.status()})
             else:
@@ -1966,14 +2498,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, b"Not found", "text/plain")
 
     def do_POST(self):
-        if self.path not in ("/model/chat", "/model/goalai", "/model/ticket"):
+        if self.path not in ("/model/chat", "/model/goalai", "/model/ticket", "/model/tsodds", "/model/scoutai"):
             self._send(404, b"Not found", "text/plain")
             return
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
-        limit = 9_000_000 if self.path == "/model/ticket" else 60000
+        limit = 9_000_000 if self.path in ("/model/ticket", "/model/tsodds") else 60000
         if n <= 0 or n > limit:
             self._json({"error": "Zpráva nebo obrázek je moc velký (max. 6 MB)."}, 400)
             return
@@ -1991,6 +2523,17 @@ class Handler(BaseHTTPRequestHandler):
             gid = int(gid) if gid else None
         except (TypeError, ValueError):
             gid = None
+        if self.path == "/model/tsodds":
+            img, mime = body.get("image"), "image/jpeg"
+            if img and img.startswith("data:"):
+                head, img = img.split(",", 1)
+                mime = head[5:].split(";")[0] or mime
+            try:
+                res = analyze_odds(img, mime, body.get("text"))
+            except Exception as e:
+                res = {"error": f"Čtení kurzů se nepovedlo: {e}"}
+            self._json(res, 200 if "games" in res else 503)
+            return
         if self.path == "/model/ticket":
             img, mime = body.get("image"), "image/jpeg"
             if img and img.startswith("data:"):
@@ -2001,6 +2544,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 res = {"error": f"Vyhodnocení se nepovedlo: {e}"}
             self._json(res, 200 if "legs" in res else 503)
+            return
+        if self.path == "/model/scoutai":
+            try:
+                res = scout_preview(gid, force=bool(body.get("force")))
+            except Exception as e:
+                res = {"error": f"Rozbor se nepovedl: {e}"}
+            self._json(res, 200 if "text" in res else 503)
             return
         if self.path == "/model/goalai":
             try:
@@ -2711,6 +3261,103 @@ td.gold, .gold { color: #fff !important; }
 @media (max-width: 720px) { .nav { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; } .nav a { flex: 0 0 auto !important; padding: 8px 12px; } }
 @media (max-width: 720px) { .goalrow { grid-template-columns: 48px 1fr; } .goalrow .acts { grid-column: 1 / -1; justify-content: flex-start; } }
 @media (max-width: 720px) { .hero2 { padding-top: 50px; } .hero2 .sun { top: 30%; width: 80vw; } .idface .bstats { grid-template-columns: repeat(3, 1fr); gap: 6px; } }
+
+/* ================= LIVE 2.0 + boční pohyblivé lišty ================= */
+#rails .rail { position: fixed; top: 64px; bottom: 0; width: var(--rw, 150px); z-index: 1; pointer-events: none; overflow: hidden; }
+#rails .rail.L { left: 0; } #rails .rail.R { right: 0; }
+#rails.off, #rails .rail:empty { display: none; }
+.rglow { position: absolute; top: 0; bottom: 0; width: 3px; }
+.rail.L .rglow, .hrail.L .rglow { right: 10px; } .rail.R .rglow, .hrail.R .rglow { left: 10px; }
+.rglow::before { content: ""; position: absolute; inset: 0; background: var(--c); opacity: .22; }
+.rglow::after { content: ""; position: absolute; left: -4px; width: 11px; height: 140px; border-radius: 8px; background: linear-gradient(180deg, transparent, var(--c), transparent);
+  filter: blur(1.5px); box-shadow: 0 0 22px var(--c); animation: rmove 3.8s linear infinite; }
+@keyframes rmove { from { transform: translateY(-160px); } to { transform: translateY(110vh); } }
+.rtag { position: absolute; z-index: 2; top: 18px; writing-mode: vertical-rl; font-family: Anton, Impact, sans-serif; font-size: 40px; letter-spacing: .14em; color: #fff;
+  text-shadow: 0 0 18px var(--c), 0 0 2px var(--c); opacity: .95; animation: rpulse 2.6s ease-in-out infinite; }
+.rail.L .rtag { left: 34px; transform: rotate(180deg); } .rail.R .rtag { right: 34px; }
+@keyframes rpulse { 50% { opacity: .55; } }
+.rlogos img { position: absolute; bottom: -120px; left: var(--x); width: 64px; height: 64px; opacity: 0; animation: rise 13.2s linear infinite; animation-delay: var(--d);
+  filter: drop-shadow(0 6px 14px rgba(0,0,0,.6)); }
+@keyframes rise { 0% { transform: translateY(0) rotate(-10deg); opacity: 0; } 8% { opacity: .75; } 85% { opacity: .75; } 100% { transform: translateY(-115vh) rotate(10deg); opacity: 0; } }
+.rtext { position: absolute; top: 0; bottom: 0; width: 22px; overflow: hidden; }
+.rail.L .rtext, .hrail.L .rtext { left: 4px; } .rail.R .rtext, .hrail.R .rtext { right: 4px; }
+.rtrack { writing-mode: vertical-rl; white-space: nowrap; animation: rscroll 46s linear infinite; font-family: Anton, Impact, sans-serif; font-size: 17px;
+  letter-spacing: .12em; text-transform: uppercase; color: rgba(255,255,255,.42); }
+.rtrack span { padding-bottom: 40px; }
+@keyframes rscroll { from { transform: translateY(0); } to { transform: translateY(-50%); } }
+.hrail { position: absolute !important; top: 0; bottom: 0; z-index: 2 !important; pointer-events: none; overflow: hidden; }
+#cine.hero2 > .hrail { position: absolute; z-index: 2; }
+.hrail.R { right: 0; width: 96px; } .hrail.L { left: 0; width: 30px; }
+.hrail .rlogos img { width: 54px; height: 54px; left: 22px; }
+.hrail.L .rglow, .hrail.L .rlogos { display: none; }
+body.rails-on .hrail { display: none; }
+@media (max-width: 720px) { .hrail.R { width: 58px; } .hrail .rlogos img { width: 36px; height: 36px; left: 16px; } .hrail .rtrack { font-size: 12px; } .hrail.L { width: 16px; } .hrail.L .rtext { left: 1px; width: 14px; } }
+
+.lg { position: relative; border-left: 4px solid var(--hc, #4cc3ff); }
+.lg .ha { font-style: normal; font-size: 10px; font-weight: 900; letter-spacing: .06em; padding: 1px 5px; border-radius: 4px; background: var(--hc); color: #fff; }
+.lg .r + .r .ha { background: #e8edf4; color: #05070b; }
+.jumbo { position: relative; overflow: hidden; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; padding: 34px 24px 24px; border-radius: 22px; margin-top: 18px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--hc) 62%, #05070b) 0%, #070a10 44%, #070a10 56%, color-mix(in srgb, var(--ac) 62%, #05070b) 100%);
+  border: 1px solid rgba(255,255,255,.16); box-shadow: 0 24px 70px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.03) inset; }
+.jumbo::before { content: ""; position: absolute; inset: 0; pointer-events: none; background-image: radial-gradient(circle, rgba(255,255,255,.09) 0 1px, transparent 1.4px); background-size: 6px 6px; }
+.jumbo::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 5px; background: linear-gradient(90deg, var(--hc) 0 48%, #fff 48% 52%, var(--ac) 52%); }
+.jsweep { position: absolute; top: 0; bottom: 0; width: 28%; left: -40%; background: linear-gradient(100deg, transparent, rgba(255,255,255,.13), transparent); animation: jsweep 5.5s ease-in-out infinite; pointer-events: none; }
+@keyframes jsweep { 0% { left: -40%; } 55%, 100% { left: 115%; } }
+.jside { display: flex; align-items: center; gap: 16px; position: relative; z-index: 1; min-width: 0; }
+.jside.away { flex-direction: row-reverse; text-align: right; }
+.jlogo { width: 96px; height: 96px; flex: none; animation: jfloat 4.2s ease-in-out infinite; filter: drop-shadow(0 0 20px color-mix(in srgb, var(--hc) 80%, transparent)); }
+.jside.away .jlogo { animation-delay: -2.1s; filter: drop-shadow(0 0 20px color-mix(in srgb, var(--ac) 80%, transparent)); }
+@keyframes jfloat { 50% { transform: translateY(-6px) scale(1.04); } }
+.jtag { position: absolute; top: -26px; left: 0; font-family: Anton, Impact, sans-serif; font-size: 14px; letter-spacing: .2em; padding: 3px 12px; color: #fff;
+  background: var(--hc); transform: skewX(-14deg); box-shadow: 0 4px 16px color-mix(in srgb, var(--hc) 60%, transparent); }
+.jside.away .jtag { left: auto; right: 0; background: var(--ac); }
+.jname b { font-family: Anton, Impact, sans-serif; font-weight: 400; font-size: 32px; text-transform: uppercase; line-height: 1.05; display: block; color: #fff; text-shadow: 0 2px 10px rgba(0,0,0,.5); }
+.jname small { color: #dfe7f1; font-weight: 700; font-size: 14px; }
+.jumbo .mid { text-align: center; position: relative; z-index: 1; background: rgba(0,0,0,.6); border: 1px solid rgba(255,255,255,.14); border-radius: 16px; padding: 10px 24px; }
+.jumbo .sc { font-family: Anton, Impact, sans-serif; font-size: 92px; line-height: 1; color: #fff; letter-spacing: .04em; text-shadow: 0 0 26px rgba(255,255,255,.25); }
+.jumbo .sc.flash { animation: goalflash 1.6s ease; }
+.jumbo .clk { color: var(--cyan); font-weight: 800; font-size: 16px; font-variant-numeric: tabular-nums; }
+.mbar { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; margin-top: 12px; font-family: Anton, Impact, sans-serif; font-size: 18px; letter-spacing: .05em; }
+.mbar .bar { height: 14px; border-radius: 8px; overflow: hidden; display: flex; background: rgba(255,255,255,.08); box-shadow: inset 0 0 0 1px rgba(255,255,255,.1); }
+.mbar .bar i { display: block; height: 100%; transition: width .9s cubic-bezier(.2,.8,.2,1); position: relative; overflow: hidden; }
+.mbar .bar i::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,.35), transparent); transform: translateX(-100%); animation: shine 2.8s linear infinite; }
+@keyframes shine { to { transform: translateX(100%); } }
+.lticker { margin-top: 12px; overflow: hidden; border-radius: 12px; background: #05070b; border: 1px solid rgba(255,255,255,.14); }
+.lticker .track { display: inline-flex; gap: 40px; padding: 10px 0; white-space: nowrap; animation: mq 45s linear infinite; }
+.lticker span { font-family: Anton, Impact, sans-serif; font-size: 19px; text-transform: uppercase; letter-spacing: .05em; color: #e9eef7; }
+.lticker span em { font-style: normal; color: var(--red); margin: 0 6px; }
+.rinkstage svg .cring { transform-box: fill-box; transform-origin: center; animation: lvspin 22s linear infinite; }
+.rinkstage svg .led { animation: ledrun 26s linear infinite; } .rinkstage svg .led.rev { animation-direction: reverse; }
+@keyframes ledrun { to { transform: translateX(-1092px); } }
+@keyframes lvspin { to { transform: rotate(360deg); } }
+.rinkstage svg .sheen { animation: sheen 7s ease-in-out infinite; }
+@keyframes sheen { 0% { transform: translateX(-400px); } 60%, 100% { transform: translateX(1400px); } }
+@media (max-width: 900px) { .jlogo { width: 60px; height: 60px; } .jname b { font-size: 20px; } .jumbo .sc { font-size: 60px; } }
+@media (max-width: 720px) {
+  .jumbo { padding: 16px 8px 14px; gap: 6px; }
+  .jside, .jside.away { flex-direction: column; text-align: center; gap: 4px; }
+  .jtag { position: static; display: inline-block; font-size: 10px; padding: 2px 8px; letter-spacing: .12em; }
+  .jlogo { width: 50px; height: 50px; } .jname b { font-size: 15px; } .jname small { font-size: 11px; }
+  .jumbo .mid { padding: 6px 8px; } .jumbo .sc { font-size: 46px; } .jumbo .clk { font-size: 12px; }
+  .lticker span { font-size: 15px; }
+}
+@media (prefers-reduced-motion: reduce) { .rlogos img, .rtrack, .rglow::after, .jsweep, .jlogo, .led, .cring, .sheen { animation: none !important; } }
+.lgrid > *, .grid > * { min-width: 0; } @media (max-width: 900px) { .lgrid { grid-template-columns: minmax(0, 1fr) !important; } }
+
+.jersey { position: relative; display: inline-block; flex: none; vertical-align: middle; filter: drop-shadow(0 4px 8px rgba(0,0,0,.45)); }
+.jersey svg { width: 100%; height: 100%; display: block; }
+.jersey img { position: absolute; right: -6px; bottom: -4px; width: 46% !important; height: 46% !important; background: #05070b; border-radius: 50%; padding: 2px; box-shadow: 0 0 0 1.5px rgba(255,255,255,.35); }
+.lrow:hover .jersey, .pcard:hover .jersey { animation: jwig .6s ease; }
+@keyframes jwig { 30% { transform: rotate(-8deg) scale(1.08); } 70% { transform: rotate(6deg) scale(1.08); } }
+
+.zbars { display: grid; gap: 6px; } .zb { display: grid; grid-template-columns: 140px 1fr 56px; gap: 8px; align-items: center; font-size: 13px; }
+.zb .b { height: 10px; border-radius: 6px; background: rgba(255,255,255,.07); position: relative; overflow: hidden; } .zb .b i { display: block; height: 100%; border-radius: 6px; }
+.zb .b em { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 2px; background: rgba(255,255,255,.5); }
+.zb b { text-align: right; font-variant-numeric: tabular-nums; }
+.scp svg { margin: 10px auto 6px; } .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.pscgrid { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 720px) { .pscgrid { grid-template-columns: minmax(0, 1fr); } .zb { grid-template-columns: 110px 1fr 48px; font-size: 12px; } }
+.scoutai { border-color: rgba(76,195,255,.35); background: linear-gradient(180deg, rgba(47,123,255,.12), rgba(12,16,23,.9)); }
 </style>
 </head>
 <body>
@@ -2825,13 +3472,25 @@ const RINK = `<svg class="rink" viewBox="0 0 1200 520" preserveAspectRatio="xMid
   <circle cx="940" cy="140" r="70" stroke="#ff4d5e"/><circle cx="940" cy="380" r="70" stroke="#ff4d5e"/>
   <path d="M110 230 a30 30 0 0 1 0 60" stroke="#ff4d5e"/><path d="M1090 230 a30 30 0 0 0 0 60" stroke="#ff4d5e"/></svg>`;
 function splitName(n) { const i = String(n).indexOf(" "); return i < 0 ? ["", n] : [n.slice(0, i), n.slice(i + 1)]; }
+
+// dres hráče v barvách týmu s jeho číslem (místo fotky)
+function jersey(team, num, size = 44, logo = "") {
+  const c = tcol(team), n = num == null ? "" : String(num);
+  return `<span class="jersey" style="width:${size}px;height:${size}px"><svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+    <path d="M22 6 L14 9 L3 20 L9 32 L15 28 L15 60 L49 60 L49 28 L55 32 L61 20 L50 9 L42 6 Q32 13 22 6 Z" fill="${c}" stroke="rgba(0,0,0,.55)" stroke-width="1.6"/>
+    <path d="M15 46 L49 46 M15 51 L49 51" stroke="#fff" stroke-width="2.4" opacity=".9"/>
+    <path d="M4.6 22.5 L10.6 30.4 M6.4 18.6 L12.2 27" stroke="#fff" stroke-width="2" opacity=".85"/><path d="M59.4 22.5 L53.4 30.4 M57.6 18.6 L51.8 27" stroke="#fff" stroke-width="2" opacity=".85"/>
+    <path d="M22 6 Q32 13 42 6" fill="none" stroke="#fff" stroke-width="2.2"/>
+    <text x="32" y="${n.length > 1 ? 40 : 41}" text-anchor="middle" font-family="Anton,Impact,sans-serif" font-size="${n.length > 1 ? 21 : 24}" fill="#fff" stroke="rgba(0,0,0,.6)" stroke-width="1.2" paint-order="stroke">${esc(n)}</text>
+  </svg>${logo ? `<img src="${esc(logo)}" alt="">` : ""}</span>`;
+}
 function playerCard(p, logo, extra = "") {
   const [first, last] = splitName(p.name);
   const dots = (p.last5 || []).slice().reverse().map((x) => `<i class="${x > 0 ? "y" : ""}"></i>`).join("");
   return `<div class="pcard reveal tilt" style="--tc:${tcol(p.team)}" ${extra}><span class="glare"></span>
     <div class="jn">${p.num ?? ""}</div><img class="wm" src="${esc(logo)}" alt="">
     ${p.streak >= 3 ? `<span class="pill hot streak">🔥 ${p.streak} v řadě</span>` : ""}
-    <div class="top"><img src="${esc(logo)}" alt=""><small>${esc(p.team)} · ${posName[p.pos] || p.pos}${p.num != null ? " · #" + p.num : ""}</small></div>
+    <div class="top">${jersey(p.team, p.num, 58, logo)}<small>${esc(p.team)} · ${posName[p.pos] || p.pos}${p.num != null ? " · #" + p.num : ""}</small></div>
     <div class="pname"><span>${esc(first)}</span><span class="pname-link" data-player="${p.id}:${p.team}" style="font-size:inherit;color:inherit;display:inline">${esc(last)}</span></div>
     <div class="big">${pc(p.pPoint)}<small>šance na kanadský bod</small></div>
     <div class="pst"><div><b>${pc(p.pGoal)}</b><small>šance na gól</small></div><div><b>${num(p.expShots, 1)}</b><small>oček. střely</small></div>
@@ -3263,6 +3922,7 @@ function route() {
   updateChatCtx();
   if (!live) stopLive();
   if (!over && HERO) { HERO.stop(); HERO = null; }
+  if (!over && !live) setRails(null, null);
   if (stats) initStats();
   else if (game) openGame(game);
   else if (live) openLive(h.startsWith("#live-") ? +h.slice(6) : null);
@@ -3311,7 +3971,7 @@ function renderOverview() {
   const byGoal = [...all].sort((a, b) => b.pGoal - a.pGoal).slice(0, 10);
   const byShots = [...all].sort((a, b) => b.expShots - a.expShots).slice(0, 10);
   const logo = (g, t) => (t === g.home ? g.homeLogo : g.awayLogo);
-  const lrow = (p, i, val) => `<div class="lrow" data-go="${p.g.id}"><span class="rk">${i + 1}</span><img src="${esc(logo(p.g, p.team))}" alt="">
+  const lrow = (p, i, val) => `<div class="lrow" data-go="${p.g.id}"><span class="rk">${i + 1}</span>${jersey(p.team, p.num, 46, logo(p.g, p.team))}
       <span class="nm"><span class="pname-link" data-player="${p.id}:${p.team}">${esc(p.name)}</span>${p.streak >= 3 ? ` <span class="pill hot">🔥${p.streak}</span>` : ""}<small>${esc(p.g.home)} – ${esc(p.g.away)} · ${fmtTime(p.g.start)}</small></span><span class="val">${val}</span></div>`;
   const valueBadge = (g) => {
     const v = g.value || {};
@@ -3321,12 +3981,18 @@ function renderOverview() {
   const sum = (f) => dayGames.reduce((a, g) => a + f(g), 0);
   const dayIso = days.find((d) => d[0] === ovDay)?.[1];
   const best = byPoint[0];
+  const heroLogos = [...new Set(dayGames.flatMap((g) => [g.homeLogo, g.awayLogo]))].filter(Boolean);
+  const heroLines = dayGames.map((g) => `${g.home} – ${g.away} ${g.start ? fmtTime(g.start) : ""}`).concat(byPoint.slice(0, 5).map((p) => `${p.name} bod ${pc(p.pPoint)}`));
+  setRails({ tag: "NHL", color: "#ff2d3d", logos: heroLogos.filter((_, i) => i % 2 === 0), lines: dayGames.map((g) => `${g.home} – ${g.away} ${g.start ? fmtTime(g.start) : ""}`) },
+    { tag: "LIVE", color: "#4cc3ff", logos: heroLogos.filter((_, i) => i % 2 === 1), lines: byPoint.slice(0, 8).map((p) => `${p.name} ${pc(p.pPoint)}`) });
   const mq = byPoint.map((p) => `<span>${esc(p.name)} <em>${pc(p.pPoint)}</em></span>`).join("");
   const seen = new Set();
   const cards = [...all].sort((a, b) => b.pPoint - a.pPoint).filter((p) => !seen.has(p.id) && seen.add(p.id)).slice(0, 8);
   el.innerHTML = `
     <section class="cine hero2" id="cine">
       <div class="sky"></div><div class="sun"></div>${SKYLINE}
+      <div class="hrail L">${railHTML({ color: "#ff2d3d", lines: heroLines })}</div>
+      <div class="hrail R">${railHTML({ color: "#4cc3ff", logos: heroLogos, lines: heroLines })}</div>
       <div class="stage3d"><canvas id="icecv"></canvas></div><canvas id="frost"></canvas>
       <div class="backword" id="backword">NHL</div>
       <div><span class="badge-gta">NHL · Předpovědi · ${dayIso ? fmtDay(dayIso) : ""}</span></div>
@@ -3501,7 +4167,7 @@ function renderMarkets() {
 }
 const PL_COLS = [
   { k: "_rank", t: "#", cls: "rank", nosort: true },
-  { k: "name", t: "Hráč", cls: "left", f: (v, p) => `<b class="pname-link" data-player="${p.id}:${p.team}">${esc(v)}</b>${p.streak >= 3 ? ` <span class="pill hot">🔥 ${p.streak} v řadě</span>` : ""}${p.injury ? ` <span class="injbadge ${p.injury.out ? "" : "dtd"}" title="${esc(p.injury.comment)}">🩹 ${esc(p.injury.status)}</span>` : !p.active ? ` <span class="pill bad">nehrál ${p.lastGameAgo} z.</span>` : ""}` },
+  { k: "name", t: "Hráč", cls: "left", f: (v, p) => `${jersey(p.team, p.num, 30)} <b class="pname-link" data-player="${p.id}:${p.team}">${esc(v)}</b>${p.streak >= 3 ? ` <span class="pill hot">🔥 ${p.streak} v řadě</span>` : ""}${p.injury ? ` <span class="injbadge ${p.injury.out ? "" : "dtd"}" title="${esc(p.injury.comment)}">🩹 ${esc(p.injury.status)}</span>` : !p.active ? ` <span class="pill bad">nehrál ${p.lastGameAgo} z.</span>` : ""}` },
   { k: "team", t: "Tým", cls: "left pos" },
   { k: "pos", t: "Poz", cls: "left pos", f: (v) => posName[v] || v },
   { k: "pPoint", t: "Šance na bod", cls: "gold", f: (v) => `<span class="pbar" style="width:${Math.round(v * 60)}px"></span>${pc(v)}` },
@@ -3636,6 +4302,11 @@ function renderGame() {
           </tbody></table></div>` : `<p class="help">Kurzy k tomuto zápasu zatím nejsou.</p>`}
       </div>
     </div>
+    ${tsCard(d)}
+    <div class="sechead"><span class="no">🔬</span><h2>Rozbor ze záznamů zápasů</h2><span class="hint">každá střela a gól sezóny</span></div>
+    <p class="help" style="margin-top:-6px">Web sám prochází záznamy <b>všech odehraných zápasů akci po akci</b> (odkud se střílelo, jakou střelou, jestli to byla dorážka, protiútok nebo přesilovka, kdo chytal)
+      a z toho počítá, jak týmy brání a jak hráči dávají góly. Nové zápasy přidává automaticky. Podle toho, jak styl hráče sedí na soupeře, jemně upraví i jeho šanci na gól.</p>
+    <div id="scout"><div class="loader"><div class="spinner"></div>Načítám rozbor…</div></div>
 
     <div class="sechead"><span class="no">▶</span><h2>Simulace zápasu</h2><span class="hint">počítač odehraje zápas 1000×</span></div>
     <div class="card">
@@ -3792,6 +4463,7 @@ function renderGame() {
   const loadCalcOdd = () => { $("codd").value = store.get(`odd:${GAME.id}:pl:${$("cpl").value}:${$("cmk").value}`) || ""; renderCalc(); };
   $("cpl").onchange = loadCalcOdd; $("cmk").onchange = loadCalcOdd; $("codd").oninput = renderCalc;
   renderMarkets(); renderPlayers(); loadCalcOdd();
+  loadScout(d);
   initSlider(); initSim(); initRink(); initCompare();
   requestAnimationFrame(() => setTimeout(() => $("view-game").querySelectorAll(".cmprow i[data-w]").forEach((i) => (i.style.width = i.dataset.w + "%")), 60));
   $("sladdo").onclick = (e) => slAdd(true, e.target); $("sladdu").onclick = (e) => slAdd(false, e.target);
@@ -4041,6 +4713,50 @@ renderSlip();
 // ===================================================================
 //  LIVE – 3D hřiště
 // ===================================================================
+
+// ---------- boční pohyblivé lišty ----------
+const RAILS = { el: null };
+function ensureRails() {
+  if (RAILS.el) return RAILS.el;
+  const r = document.createElement("div"); r.id = "rails";
+  r.innerHTML = `<div class="rail L"></div><div class="rail R"></div>`;
+  document.body.appendChild(r); RAILS.el = r;
+  const fit = () => {
+    const z = parseFloat(getComputedStyle(document.body).zoom) || 1;
+    const w = Math.min(190, (innerWidth / z - 1280) / 2 - 8);
+    r.style.setProperty("--rw", w + "px");
+    const on = w >= 80;
+    r.classList.toggle("off", !on); document.body.classList.toggle("rails-on", on);
+  };
+  addEventListener("resize", fit); fit();
+  return r;
+}
+function railHTML(o) {
+  if (!o) return "";
+  const logos = (o.logos || []).filter(Boolean);
+  const n = 6;
+  const L = logos.length ? Array.from({ length: n }, (_, i) => `<img src="${esc(logos[i % logos.length])}" style="--d:${(-i * 13.2 / n).toFixed(2)}s;--x:${[18, 52, 30, 60, 10, 42][i]}%" alt="">`).join("") : "";
+  const txt = (o.lines || []).map((l) => esc(l)).join("  ✦  ");
+  return `<div class="rglow" style="--c:${o.color || "#4cc3ff"}"></div>
+    ${o.tag ? `<div class="rtag" style="--c:${o.color || "#4cc3ff"}">${esc(o.tag)}</div>` : ""}
+    <div class="rlogos">${L}</div>
+    <div class="rtext">${txt ? `<div class="rtrack"><span>${txt}  ✦  </span><span>${txt}  ✦  </span></div>` : ""}</div>`;
+}
+function setRails(left, right) {
+  const r = ensureRails();
+  const key = JSON.stringify([left, right]);
+  if (r.dataset.key === key) return;
+  r.dataset.key = key;
+  r.querySelector(".L").innerHTML = railHTML(left);
+  r.querySelector(".R").innerHTML = railHTML(right);
+}
+function hexRgb(h) { h = (h || "#888").replace("#", ""); return [0, 2, 4].map((i) => parseInt(h.substr(i, 2), 16)); }
+function liveColors(H, A) {
+  const hc = tcol(H); let ac = tcol(A);
+  const a = hexRgb(hc), b = hexRgb(ac);
+  if (Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 130) ac = "#1f2937";
+  return { hc, ac };
+}
 const LV = { id: null, data: null, timer: null, shown: 0, replay: null, filt: { shots: true, goals: true, missed: false, blocked: false, hits: false, pens: true, faceoff: false }, per: "all", d3: true };
 const EVCZ = { "faceoff": "Vhazování", "shot-on-goal": "Střela na branku", "goal": "GÓL", "missed-shot": "Střela mimo", "blocked-shot": "Zblokovaná střela",
   "hit": "Hit (bodyček)", "penalty": "Vyloučení", "takeaway": "Získaný puk", "giveaway": "Ztracený puk" };
@@ -4058,14 +4774,14 @@ async function openLive(id) {
   el.innerHTML = `<div class="sechead" style="margin-top:30px"><span class="no"><span class="livedot"></span></span><h2>Live hřiště</h2><span class="hint">zápasy dnes a včera</span></div>
     <p class="help" style="margin-top:-6px">Vyber zápas. <b>Červená tečka = právě se hraje</b> (stránka se sama obnovuje každých 8 vteřin). U odehraných zápasů si můžeš pustit <b>záznam</b> – puk projede celý zápas akci po akci.
       U zápasů, které ještě nezačaly, uvidíš odpočet.</p>
-    <div class="lgames" id="lgames"><div class="loader" style="padding:20px">Načítám zápasy…</div></div><div id="lmain"></div>`;
+    <p class="help" style="margin-top:4px"><b>D</b> = domácí tým (hraje doma), <b>V</b> = hosté (hrají venku). Domácí je v seznamu vždy nahoře.</p><div class="lgames" id="lgames"><div class="loader" style="padding:20px">Načítám zápasy…</div></div><div id="lmain"></div>`;
   let list;
   try { list = (await getJSON("/model/livegames")).games; } catch (e) { $("lgames").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
   const stLabel = (g) => (["LIVE", "CRIT"].includes(g.state) ? `<span class="livedot"></span> ${g.period ? PERCZ(g.period, g.periodType) : "ŽIVĚ"} · ${g.clock?.inIntermission ? "přestávka" : g.clock?.timeRemaining || ""}`
     : ["FINAL", "OFF"].includes(g.state) ? `konec${g.periodType && g.periodType !== "REG" ? " (" + g.periodType + ")" : ""} · záznam` : `🕒 ${fmtDay(g.start)} ${fmtTime(g.start)}`);
-  $("lgames").innerHTML = list.length ? list.map((g) => `<div class="lg ${g.id === id ? "on" : ""}" data-id="${g.id}">
-    <div class="r"><img src="${esc(g.homeLogo)}" alt=""><span>${esc(g.home)}</span><b>${g.score[0] ?? ""}</b></div>
-    <div class="r"><img src="${esc(g.awayLogo)}" alt=""><span>${esc(g.away)}</span><b>${g.score[1] ?? ""}</b></div><small>${stLabel(g)}</small></div>`).join("")
+  $("lgames").innerHTML = list.length ? list.map((g) => `<div class="lg ${g.id === id ? "on" : ""}" data-id="${g.id}" style="--hc:${tcol(g.home)}">
+    <div class="r"><img src="${esc(g.homeLogo)}" alt=""><span>${esc(g.home)} <i class="ha" title="domácí">D</i></span><b>${g.score[0] ?? ""}</b></div>
+    <div class="r"><img src="${esc(g.awayLogo)}" alt=""><span>${esc(g.away)} <i class="ha" title="hosté">V</i></span><b>${g.score[1] ?? ""}</b></div><small>${stLabel(g)}</small></div>`).join("")
     : `<p class="help">Dnes ani včera nejsou žádné zápasy.</p>`;
   $("lgames").querySelectorAll(".lg").forEach((c) => (c.onclick = () => (location.hash = "live-" + c.dataset.id)));
   if (!id) {
@@ -4105,27 +4821,53 @@ function elapsedMin(d) {
   return Math.min(65, (Math.min(d.period, 3) - 1) * 20 + (d.period > 3 ? 20 + (300 - rem) / 60 : (1200 - rem) / 60));
 }
 function rinkSvg(d) {
-  const S = 5, W = 200 * S, H = 85 * S, X = (x) => (x + 100) * S, Y = (y) => (42.5 - y) * S;
-  const homeSide = d.homeSide || "left";
-  const lbl = (side, ab) => `<text x="${side === "left" ? X(-80) : X(80)}" y="${Y(-37)}" font-size="22" font-weight="800" fill="#334155" text-anchor="middle">${ab}</text>`;
-  return `<svg viewBox="-10 -10 ${W + 20} ${H + 20}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">
-    <defs><radialGradient id="ice2" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#f4f9ff"/><stop offset="1" stop-color="#cddcec"/></radialGradient>
+  const S = 5, W = 200 * S, H = 85 * S, X = (x) => (x + 100) * S, Y = (y) => (42.5 - y) * S, M = 46;
+  const homeSide = d.homeSide || "left", awaySide = homeSide === "left" ? "right" : "left";
+  const hc = LV.hc || "#4cc3ff", ac = LV.ac || "#e8edf4";
+  const zone = (side, c) => `<rect x="${side === "left" ? 0 : X(25)}" y="0" width="${X(-25)}" height="${H}" fill="${c}" opacity=".13"/>`;
+  const endTxt = (side, top, bottom, c) => { const x = side === "left" ? X(-95.6) : X(95.6), r = side === "left" ? -90 : 90;
+    return `<text transform="translate(${x} ${Y(6)}) rotate(${r})" font-family="Anton,Impact,sans-serif" font-size="26" letter-spacing="3" fill="${c}" opacity=".75" text-anchor="${side === "left" ? "start" : "end"}">${top}</text>
+      <text transform="translate(${x} ${Y(-6)}) rotate(${r})" font-family="Anton,Impact,sans-serif" font-size="26" letter-spacing="3" fill="${c}" opacity=".75" text-anchor="${side === "left" ? "end" : "start"}">${bottom}</text>`; };
+  const pill = (side, txt, c) => { const cx = side === "left" ? X(-58) : X(58);
+    return `<g><rect x="${cx - 78}" y="${Y(-38.5) - 19}" width="156" height="28" rx="14" fill="${c}" opacity=".92"/><text x="${cx}" y="${Y(-38.5)}" font-size="15" font-weight="900" fill="#fff" text-anchor="middle" letter-spacing="1">${txt}</text></g>`; };
+  const BW = X(72) - X(-72);
+  const ledTxt = (txt, c) => { const t = `<text font-family="Anton,Impact,sans-serif" font-size="20" fill="${c}" y="0" textLength="1080" lengthAdjust="spacing">${txt}</text>`; return t; };
+  const strip = (y, txt, c, rev) => `<g clip-path="url(#ledclip${rev ? 2 : 1})"><rect x="${X(-72)}" y="${y - 22}" width="${BW}" height="30" rx="6" fill="#05070b"/>
+      <g class="led ${rev ? "rev" : ""}"><g transform="translate(${X(-72)} ${y})">${[0, 1, 2, 3].map((k) => `<g transform="translate(${k * 1092} 0)">${ledTxt(txt, c)}</g>`).join("")}</g></g></g>`;
+  const rep = (t) => Array(3).fill(t).join("   ✦   ") + "   ✦   ";
+  const grad = homeSide === "left" ? [hc, ac] : [ac, hc];
+  return `<svg viewBox="${-M - 4} ${-M - 4} ${W + 2 * M + 8} ${H + 2 * M + 8}" xmlns="http://www.w3.org/2000/svg" font-family="Inter,sans-serif">
+    <defs><radialGradient id="ice2" cx="50%" cy="50%" r="70%"><stop offset="0" stop-color="#f7fbff"/><stop offset="1" stop-color="#d3e1f0"/></radialGradient>
+      <linearGradient id="boardg" x1="0" x2="1"><stop offset="0" stop-color="${grad[0]}"/><stop offset=".47" stop-color="#1e293b"/><stop offset=".53" stop-color="#1e293b"/><stop offset="1" stop-color="${grad[1]}"/></linearGradient>
+      <linearGradient id="sheeng" x1="0" x2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset=".5" stop-color="#fff" stop-opacity=".55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
       <clipPath id="rclip"><rect x="0" y="0" width="${W}" height="${H}" rx="${28 * S}"/></clipPath>
+      <clipPath id="ledclip1"><rect x="${X(-72)}" y="${-M + 2}" width="${BW}" height="34" rx="6"/></clipPath>
+      <clipPath id="ledclip2"><rect x="${X(-72)}" y="${H + 8}" width="${BW}" height="34" rx="6"/></clipPath>
+      <clipPath id="logoclip"><circle cx="${X(0)}" cy="${Y(0)}" r="${15 * S - 4}"/></clipPath>
       <radialGradient id="puckg" cx="40%" cy="35%" r="70%"><stop offset="0" stop-color="#4b5563"/><stop offset="1" stop-color="#030712"/></radialGradient></defs>
-    <rect x="-8" y="-8" width="${W + 16}" height="${H + 16}" rx="${30 * S}" fill="#0f172a" stroke="#64748b" stroke-width="6"/>
+    <rect x="${-M}" y="${-M}" width="${W + 2 * M}" height="${H + 2 * M}" rx="${28 * S + M}" fill="#0b0f16" stroke="url(#boardg)" stroke-width="8"/>
+    ${strip(-M + 26, rep(`${esc(d.home.abbr)} · DOMÁCÍ · ${esc(d.home.name)}`), hc, false)}
+    ${strip(H + 32, rep(`${esc(d.away.abbr)} · HOSTÉ · ${esc(d.away.name)}`), ac === "#1f2937" ? "#e8edf4" : ac, true)}
+    <rect x="-6" y="-6" width="${W + 12}" height="${H + 12}" rx="${28 * S + 6}" fill="#e2e8f0"/>
     <g clip-path="url(#rclip)"><rect x="0" y="0" width="${W}" height="${H}" fill="url(#ice2)"/>
-      <image href="${esc(d.home.logo)}" x="${X(0) - 70}" y="${Y(0) - 70}" width="140" height="140" opacity=".12"/>
+      ${zone(homeSide, hc)}${zone(awaySide, ac)}
+      <rect class="sheen" x="0" y="-60" width="160" height="${H + 120}" fill="url(#sheeng)" transform="skewX(-18)" opacity=".7"/>
       <line x1="${X(0)}" x2="${X(0)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="${S * 1.2}"/>
       <line x1="${X(-25)}" x2="${X(-25)}" y1="0" y2="${H}" stroke="#2563eb" stroke-width="${S * 1.2}"/><line x1="${X(25)}" x2="${X(25)}" y1="0" y2="${H}" stroke="#2563eb" stroke-width="${S * 1.2}"/>
       <line x1="${X(-89)}" x2="${X(-89)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="3"/><line x1="${X(89)}" x2="${X(89)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="3"/>
-      <circle cx="${X(0)}" cy="${Y(0)}" r="${15 * S}" fill="none" stroke="#2563eb" stroke-width="3"/><circle cx="${X(0)}" cy="${Y(0)}" r="${S}" fill="#2563eb"/>
+      <circle cx="${X(0)}" cy="${Y(0)}" r="${15 * S}" fill="#fff" opacity=".92"/>
+      <image href="${esc(d.home.logo)}" x="${X(0) - 64}" y="${Y(0) - 64}" width="128" height="128" clip-path="url(#logoclip)"/>
+      <circle class="cring" cx="${X(0)}" cy="${Y(0)}" r="${15 * S + 7}" fill="none" stroke="${hc}" stroke-width="5" stroke-dasharray="18 12" opacity=".9"/>
+      <circle cx="${X(0)}" cy="${Y(0)}" r="${15 * S}" fill="none" stroke="#2563eb" stroke-width="3"/>
+      <text x="${X(0)}" y="${Y(0) + 15 * S + 30}" font-family="Anton,Impact,sans-serif" font-size="17" letter-spacing="3" fill="${hc}" text-anchor="middle" opacity=".9">DOMÁCÍ ${esc(d.home.abbr)}</text>
       ${[-69, 69].map((fx) => [22, -22].map((fy) => `<circle cx="${X(fx)}" cy="${Y(fy)}" r="${15 * S}" fill="none" stroke="#e11d48" stroke-width="3"/><circle cx="${X(fx)}" cy="${Y(fy)}" r="${S}" fill="#e11d48"/>`).join("")).join("")}
       ${[-20, 20].map((fx) => [22, -22].map((fy) => `<circle cx="${X(fx)}" cy="${Y(fy)}" r="${S}" fill="#e11d48"/>`).join("")).join("")}
       <path d="M${X(-89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 1 ${X(-89)} ${Y(-4)}" fill="#93c5fd" opacity=".8" stroke="#e11d48" stroke-width="3"/>
       <path d="M${X(89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 0 ${X(89)} ${Y(-4)}" fill="#93c5fd" opacity=".8" stroke="#e11d48" stroke-width="3"/>
       <rect x="${X(-92.3)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
       <rect x="${X(89)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
-      ${lbl(homeSide, "branka " + d.home.abbr)}${lbl(homeSide === "left" ? "right" : "left", "branka " + d.away.abbr)}
+      ${endTxt(homeSide, "DOMÁCÍ", esc(d.home.abbr), hc)}${endTxt(awaySide, "HOSTÉ", esc(d.away.abbr), ac)}
+      ${pill(homeSide, "BRANKA " + esc(d.home.abbr) + " · DOMA", hc)}${pill(awaySide, "BRANKA " + esc(d.away.abbr) + " · HOSTÉ", ac)}
       <g id="evlayer"></g>
       <g id="puck" style="transform:translate(${X(0)}px,${Y(0)}px)"><ellipse cx="0" cy="4" rx="13" ry="6" fill="rgba(0,0,0,.25)"/><circle r="10" fill="url(#puckg)" stroke="#000" stroke-width="2"/></g>
     </g></svg>`;
@@ -4138,11 +4880,11 @@ function evVisible(e) {
 }
 function evMark(e, d, ripple) {
   if (e.x == null || e.y == null) return "";
-  const S = 5, x = (e.x + 100) * S, y = (42.5 - e.y) * S, c = e.team === d.home.abbr ? "#0ea5e9" : "#8b5cf6";
+  const S = 5, x = (e.x + 100) * S, y = (42.5 - e.y) * S, c = e.team === d.home.abbr ? LV.hc || "#0ea5e9" : LV.ac || "#8b5cf6";
   const tip = `<title>${PERCZ(e.per)} ${e.time} · ${EVCZ[e.type]} · ${e.who ? e.who.name : ""} (${e.team || ""})</title>`;
   let m = "";
   if (e.type === "goal") m = `<g class="ev goal"><circle cx="${x}" cy="${y}" r="14" fill="#fbbf24" stroke="#78350f" stroke-width="3"/><text x="${x}" y="${y + 5}" font-size="15" font-weight="900" text-anchor="middle" fill="#78350f">G</text>${tip}</g>`;
-  else if (e.type === "shot-on-goal") m = `<circle class="ev" cx="${x}" cy="${y}" r="7" fill="${c}" stroke="#fff" stroke-width="2">${tip}</circle>`;
+  else if (e.type === "shot-on-goal") m = `<circle class="ev" cx="${x}" cy="${y}" r="8" fill="${c}" stroke="#05070b" stroke-width="2">${tip}</circle>`;
   else if (e.type === "missed-shot") m = `<circle class="ev" cx="${x}" cy="${y}" r="6" fill="none" stroke="${c}" stroke-width="3">${tip}</circle>`;
   else if (e.type === "blocked-shot") m = `<g class="ev"><path d="M${x - 6} ${y - 6} L${x + 6} ${y + 6} M${x + 6} ${y - 6} L${x - 6} ${y + 6}" stroke="${c}" stroke-width="3.5"/>${tip}</g>`;
   else if (e.type === "hit") m = `<rect class="ev" x="${x - 6}" y="${y - 6}" width="12" height="12" transform="rotate(45 ${x} ${y})" fill="#64748b" opacity=".8">${tip}</rect>`;
@@ -4173,12 +4915,19 @@ function liveCounts(d, evs) {
 function renderLive() {
   const d = LV.data, H = d.home.abbr, A = d.away.abbr;
   const fut = ["FUT", "PRE"].includes(d.state), fin = ["FINAL", "OFF"].includes(d.state);
+  Object.assign(LV, liveColors(H, A));
+  const hc = LV.hc, ac = LV.ac;
+  setRails({ tag: "DOMÁCÍ", color: hc, logos: [d.home.logo], lines: [d.home.name, "domácí tým", "hraje doma", "live NHL"] },
+    { tag: "HOSTÉ", color: ac === "#1f2937" ? "#e8edf4" : ac, logos: [d.away.logo], lines: [d.away.name, "hosté", "hrají venku", "live NHL"] });
   $("lmain").innerHTML = `
-    <div class="lscore" style="--hc:${tcol(H)};--ac:${tcol(A)}">
-      <div class="t"><img src="${esc(d.home.logo)}" alt=""><div><b>${esc(d.home.name)}</b><small>doma · střely <span id="lsogh">${d.home.sog ?? 0}</span></small></div></div>
+    <div class="jumbo" style="--hc:${hc};--ac:${ac}"><i class="jsweep"></i>
+      <div class="jside home"><span class="jtag">DOMÁCÍ</span><img class="jlogo" src="${esc(d.home.logo)}" alt=""><div class="jname"><b>${esc(d.home.name)}</b><small>${H} · hraje doma · střely <span id="lsogh">${d.home.sog ?? 0}</span></small></div></div>
       <div class="mid"><div class="clk" id="lclk"></div><div class="sc" id="lsc">${d.home.score ?? 0} : ${d.away.score ?? 0}</div><div id="lsit"></div></div>
-      <div class="t r"><img src="${esc(d.away.logo)}" alt=""><div><b>${esc(d.away.name)}</b><small>venku · střely <span id="lsoga">${d.away.sog ?? 0}</span></small></div></div>
+      <div class="jside away"><span class="jtag">HOSTÉ</span><img class="jlogo" src="${esc(d.away.logo)}" alt=""><div class="jname"><b>${esc(d.away.name)}</b><small>${A} · hrají venku · střely <span id="lsoga">${d.away.sog ?? 0}</span></small></div></div>
     </div>
+    <div class="mbar"><span style="color:${hc}">${H}</span><div class="bar"><i id="mbh" style="width:50%;background:${hc}"></i><i id="mba" style="width:50%;background:${ac === "#1f2937" ? "#e8edf4" : ac}"></i></div><span>${A}</span></div>
+    <p class="help" style="margin-top:4px;text-align:center">Pruh ukazuje <b>tlak na bránu</b> – jaký podíl ze všech střel na branku vystřelil který tým. Čím delší barva, tím víc tým útočí.</p>
+    <div class="lticker"><div class="track" id="ltick"></div></div>
     ${fut ? `<div class="card" style="margin-top:14px;text-align:center"><h3 class="display" style="font-size:40px;margin:6px 0">Zápas ještě nezačal</h3>
       <div class="countdown" data-start="${d.start}" style="font-size:20px"></div><p class="help">Jakmile začne, uvidíš tady živě puk, střely a vyloučení. Mezitím se podívej na <a href="#zapas-${d.id}">předpověď zápasu</a>.</p></div>` : ""}
     <div class="lfilters">
@@ -4190,7 +4939,7 @@ function renderLive() {
     </div>
     <p class="help">Hřiště ukazuje akce zápasu přesně tam, kde se staly. <b>Černý puk</b> se přesouvá na místo poslední akce. Barevná tečka = střela na branku (barva týmu), <b>zlaté G</b> = gól,
       prázdný kroužek = střela mimo, křížek = zblokovaná střela, šedý kosočtverec = hit, <b>červené !</b> = vyloučení. Najeď na značku myší a uvidíš, kdo to byl.
-      <b style="color:#0ea5e9">Modrá = ${H} (domácí)</b>, <b style="color:#8b5cf6">fialová = ${A} (hosté)</b>. U spodního okraje je napsané, čí je která branka (v každé třetině se strany mění). Zaškrtávátky výše si vybereš, co chceš vidět.</p>
+      <b style="color:${hc}">● barva ${H} = domácí</b>, <b style="color:${ac === "#1f2937" ? "#e8edf4" : ac}">● barva ${A} = hosté</b>. Polovina hřiště podbarvená barvou týmu je jeho obranné pásmo (tam stojí jeho brankář) – v každé třetině se strany mění. Uprostřed ledu je <b>logo domácích</b>, na mantinelech běží jména týmů. Zaškrtávátky výše si vybereš, co chceš vidět.</p>
     <div class="lgrid">
       <div><div class="rinkstage ${LV.d3 ? "d3" : ""}" id="rstage"><div class="tilt3d">${rinkSvg(d)}</div></div>
         <div class="sechead" style="margin-top:20px"><h2 style="font-size:34px">Tempo zápasu</h2><span class="hint">skutečnost vs. předpověď</span></div><div class="pace" id="lpace"></div>
@@ -4232,6 +4981,15 @@ function updatePanels(upto) {
   $("lclk").innerHTML = replay ? `▶ záznam · ${last ? PERCZ(last.per) + " · " + last.time : ""}`
     : fin ? `Konec zápasu${d.end && d.end !== "REG" ? " (" + (d.end === "SO" ? "po nájezdech" : "po prodloužení") + ")" : ""}` : d.period ? `<span class="livedot"></span> ${PERCZ(d.period, d.periodType)} · ${d.clock?.inIntermission ? "přestávka" : (d.clock?.timeRemaining || "") + " do konce"}` : "";
   $("lsit").innerHTML = replay ? sitInfo(last?.sit, { ...d, state: "LIVE" }) : sitInfo(d.situation, d);
+  { const sh = replay ? c[H].sog : d.home.sog ?? c[H].sog, sa = replay ? c[A].sog : d.away.sog ?? c[A].sog, tot = sh + sa;
+    const ph = tot ? Math.round((sh / tot) * 100) : 50;
+    if ($("mbh")) { $("mbh").style.width = ph + "%"; $("mba").style.width = 100 - ph + "%"; }
+    const lastGoal = [...evs].reverse().find((e) => e.type === "goal");
+    const gh = replay ? c[H].g : d.home.score ?? c[H].g, ga = replay ? c[A].g : d.away.score ?? c[A].g;
+    const items = [`${H} ${gh}<em>:</em>${ga} ${A}`, `střely ${sh}<em>:</em>${sa}`, `vyloučení ${c[H].pen}<em>:</em>${c[A].pen}`, `hity ${c[H].hits}<em>:</em>${c[A].hits}`,
+      `domácí <em>${H}</em> · hosté <em>${A}</em>`, lastGoal ? `poslední gól <em>${esc(lastGoal.team)}</em> ${lastGoal.who ? esc(lastGoal.who.name) : ""}` : "zatím bez gólu",
+      `tlak na bránu ${H} ${ph} %`];
+    const t = $("ltick"); if (t) { const html = items.map((x) => `<span>${x}</span>`).join(""); t.innerHTML = html + html; } }
   const goalsEv = evs.filter((e) => e.type === "goal");
   const gEl = $("lgoals");
   if (gEl && gEl.dataset.n !== String(goalsEv.length)) {
@@ -4531,34 +5289,66 @@ async function downloadId() {
 // ===================================================================
 //  Tikety z Tipsportu
 // ===================================================================
-const TK = { img: null, busy: false, last: null };
+const TK = { img: null, busy: false, last: null, mode: "ticket" };
 const KINDCZ = { winner_ot: "vítěz vč. prodloužení", "1x2": "výsledek (60 min)", total_goals: "góly celkem", team_goals: "góly týmu", total_shots: "střely celkem",
   team_shots: "střely týmu", total_pens: "vyloučení", total_pim: "trestné minuty", total_hits: "hity", player_point: "bod hráče", player_goal: "gól hráče",
   player_assist: "asistence hráče", player_2points: "2+ body hráče", player_shots: "střely hráče", first_goal_team: "první gól (tým)", first_goal_player: "první gól (hráč)",
   pp_goal_team: "gól v přesilovce", other: "jiná sázka" };
 function tkHistory() { try { return JSON.parse(store.get("tk_hist") || "[]"); } catch (e) { return []; } }
+
+// ---------- Kurzy z Tipsportu (ze screenshotu) ----------
+function tsLocal() { try { return JSON.parse(store.get("tsodds") || "{}"); } catch (e) { return {}; } }
+function tsSave(games) {
+  const all = tsLocal();
+  games.forEach((g) => (all[g.gameId] = { at: g.at, markets: g.markets, home: g.home, away: g.away, start: g.start }));
+  const keys = Object.keys(all).sort((a, b) => (all[b].at || "").localeCompare(all[a].at || "")).slice(0, 40);
+  store.set("tsodds", JSON.stringify(Object.fromEntries(keys.map((k) => [k, all[k]]))));
+}
+function tsTable(rec) {
+  const pct = (x) => (x == null ? "–" : Math.round(x * 100) + " %");
+  return `<div class="tablewrap" style="background:none"><table class="t"><thead><tr><th class="left">Sázka</th><th class="left">Tip</th><th>Kurz Tipsport</th><th>Šance (model)</th><th>Férový kurz</th><th>Hodnota</th></tr></thead><tbody>
+    ${rec.markets.map((m) => `<tr><td class="left">${esc(m.market || "")}</td><td class="left"><b>${esc(m.selection || "")}</b>${m.warn ? `<br><small style="color:#ff6b77">⚠ ${esc(m.warn)}</small>` : ""}${m.note && m.prob ? `<br><small class="muted">${esc(m.note)}</small>` : ""}</td>
+      <td><b style="font-size:16px">${(+m.odds).toFixed(2)}</b></td><td>${pct(m.prob)}</td><td>${m.fair ?? "–"}</td>
+      <td>${m.ev == null ? `<small class="muted">model to neumí</small>` : `<span class="pill ${m.ev > 0.03 ? "good" : m.ev < -0.05 ? "hot" : ""}">${m.ev > 0 ? "+" : ""}${Math.round(m.ev * 100)} %</span>`}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+function tsCard(d) {
+  const rec = d.tipsport || tsLocal()[d.id];
+  return `<div class="card" style="margin-top:16px;border-color:rgba(255,45,61,.35)"><b>🟦 Kurzy Tipsport</b>
+    ${rec ? `<p class="help" style="margin:4px 0 10px">Kurzy přečtené z tvého screenshotu (načteno ${esc((rec.at || "").replace("T", " ").slice(0, 16))}). <b>Hodnota</b> = jestli se sázka podle modelu vyplatí: <b>+10 %</b> znamená, že při stovce takových sázek bys v průměru vydělal 10 % vkladu. Zelená = vyplatí se, červená = spíš ne. Kurzy se mění – před sázkou zkontroluj aktuální.</p>${tsTable(rec)}
+      <p class="help"><a href="#tikety" onclick="TK.mode='odds'">Nahrát novější kurzy →</a></p>`
+    : `<p class="help" style="margin:4px 0 0">Tipsport nemá veřejné rozhraní, takže kurzy si sem načteš sám: v aplikaci Tipsport otevři tenhle zápas, udělej <b>screenshot kurzů</b> a nahraj ho v záložce
+      <a href="#tikety" onclick="TK.mode='odds'"><b>Tikety → Kurzy z Tipsportu</b></a>. AI kurzy přečte a model u každého spočítá, jestli se vyplatí. Pak se ukážou tady.</p>`}</div>`;
+}
 function openTickets() {
   const el = $("view-tk");
   const hist = tkHistory();
+  const odds = TK.mode === "odds";
   el.innerHTML = `
-    <div class="sechead" style="margin-top:30px"><span class="no">TK</span><h2>Moje tikety z Tipsportu</h2></div>
-    <div class="helpbox"><div class="help" style="margin:0"><ul>
+    <div class="sechead" style="margin-top:30px"><span class="no">TK</span><h2>${odds ? "Kurzy z Tipsportu" : "Moje tikety z Tipsportu"}</h2></div>
+    <div class="seg" id="tkmode" style="margin-bottom:14px"><button data-m="ticket" class="${odds ? "" : "on"}">🎫 Vyhodnotit můj tiket</button><button data-m="odds" class="${odds ? "on" : ""}">📈 Načíst kurzy z Tipsportu</button></div>
+    ${odds ? `<div class="helpbox"><div class="help" style="margin:0"><ul>
+      <li><b>Proč přes screenshot:</b> Tipsport nemá veřejné rozhraní pro kurzy a stahovat je z jejich webu automaticky nesmím. Takže je sem přeneseš ty – stačí screenshot.</li>
+      <li><b>Jak na to:</b> v aplikaci Tipsport otevři NHL zápas (nebo seznam NHL zápasů) a udělej <b>screenshot kurzů</b>. Klidně víc zápasů najednou nebo detail jednoho zápasu (góly, střely, hráči…).</li>
+      <li>AI kurzy přečte a model u <b>každého kurzu</b> spočítá šanci, férový kurz a <b>jestli se sázka vyplatí</b>. Kurzy se pak ukážou i v detailu zápasu.</li>
+      <li>Funguje pro zápasy, které ještě nezačaly. Další screenshot stejného zápasu kurzy doplní / aktualizuje.</li>
+    </ul></div></div>` : `<div class="helpbox"><div class="help" style="margin:0"><ul>
       <li><b>Jak na to:</b> v aplikaci Tipsport otevři tiket (v Moje tikety) a udělej <b>screenshot</b>. Ten sem nahraj – na mobilu klepni na rámeček a vyber fotku, na počítači ho sem přetáhni nebo vlož <b>Ctrl+V</b>.</li>
       <li>AI tiket přečte, najde zápasy a hráče a <b>model každou sázku spočítá</b>: šance, férový kurz, jestli se vyplatí, zranění. U odehraných zápasů řekne, <b>co vyšlo a co ne</b>.</li>
       <li>Pak dostaneš <b>komentář a návrh úpravy</b> – co vyhodit a čím nahradit. Funguje pro NHL zápasy z posledních 7 dní a nadcházející.</li>
       <li>Obrázek se nikam neukládá, jen se pošle AI k přečtení. V prohlížeči si pamatuju jen výsledky posledních vyhodnocení.</li>
-    </ul></div></div>
+    </ul></div></div>`}
     <div class="tkgrid">
       <div class="card">
-        <div class="drop" id="tkdrop"><b style="font-size:17px">Nahrát screenshot tiketu</b><p class="help">klepni / přetáhni sem / Ctrl+V</p><div id="tkprev"></div></div>
+        <div class="drop" id="tkdrop"><b style="font-size:17px">${odds ? "Nahrát screenshot kurzů" : "Nahrát screenshot tiketu"}</b><p class="help">klepni / přetáhni sem / Ctrl+V</p><div id="tkprev"></div></div>
         <input type="file" id="tkfile" accept="image/*" style="display:none">
-        <p class="help" style="margin-top:14px">…nebo vlož text tiketu (zkopírovaný z webu Tipsportu):</p>
+        <p class="help" style="margin-top:14px">…nebo vlož text ${odds ? "s kurzy" : "tiketu"} (zkopírovaný z webu Tipsportu):</p>
         <textarea id="tktext" rows="4" style="width:100%;background:rgba(255,255,255,.05);color:var(--text);border:1px solid var(--line2);border-radius:10px;padding:10px;font:inherit" placeholder="např. Edmonton - Vegas, Vítěz zápasu: Edmonton 1.99&#10;McDavid Connor - kanadský bod: ano 1.45"></textarea>
-        <button class="btn primary" id="tkgo" style="width:100%;margin-top:12px;font-size:16px;padding:13px">Vyhodnotit tiket</button>
-        ${hist.length ? `<h3 style="margin:22px 0 8px;font-size:15px">Poslední vyhodnocení</h3><div class="tkhist">${hist.map((h, i) => `<div class="card h" data-i="${i}" style="padding:12px">
+        <button class="btn primary" id="tkgo" style="width:100%;margin-top:12px;font-size:16px;padding:13px">${odds ? "Načíst a spočítat kurzy" : "Vyhodnotit tiket"}</button>
+        ${odds ? tsSavedList() : ""}${!odds && hist.length ? `<h3 style="margin:22px 0 8px;font-size:15px">Poslední vyhodnocení</h3><div class="tkhist">${hist.map((h, i) => `<div class="card h" data-i="${i}" style="padding:12px">
           <b>${esc(h.title)}</b><br><small class="muted">${esc(h.when)} · ${h.legs} sázek · kurz ${h.odds ?? "–"}</small><br><span class="${h.status === "won" ? "okc" : h.status === "lost" ? "noc" : "muted"}">${h.status === "won" ? "✅ vyhrál" : h.status === "lost" ? "❌ prohrál" : "⏳ otevřený"}</span></div>`).join("")}</div>` : ""}
       </div>
-      <div id="tkres"><div class="card" style="min-height:260px;display:grid;place-items:center;text-align:center"><div><div class="display" style="font-size:42px;color:#fff">Čekám na tiket</div><p class="help">Výsledek vyhodnocení se ukáže tady.</p></div></div></div>
+      <div id="tkres"><div class="card" style="min-height:260px;display:grid;place-items:center;text-align:center"><div><div class="display" style="font-size:42px;color:#fff">${odds ? "Čekám na kurzy" : "Čekám na tiket"}</div><p class="help">Výsledek se ukáže tady.</p></div></div></div>
     </div>`;
   const drop = $("tkdrop"), file = $("tkfile");
   drop.onclick = () => file.click();
@@ -4566,7 +5356,9 @@ function openTickets() {
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
   drop.ondragleave = () => drop.classList.remove("over");
   drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; if (f) loadTkImage(f); };
-  $("tkgo").onclick = sendTicket;
+  $("tkgo").onclick = () => (TK.mode === "odds" ? sendOdds() : sendTicket());
+  el.querySelectorAll("#tkmode button").forEach((b) => (b.onclick = () => { TK.mode = b.dataset.m; openTickets(); }));
+  el.querySelectorAll(".tssaved .h").forEach((c) => (c.onclick = () => { const r = tsLocal()[c.dataset.g]; if (r) renderOdds({ games: [{ gameId: +c.dataset.g, ...r }] }); }));
   el.querySelectorAll(".tkhist .h").forEach((c) => (c.onclick = () => { const h = tkHistory()[+c.dataset.i]; if (h?.data) renderTicket(h.data); }));
   if (TK.img) $("tkprev").innerHTML = `<img src="${TK.img}" alt="">`;
 }
@@ -4587,12 +5379,51 @@ function loadTkImage(f) {
   };
   img.src = url;
 }
+
+function tsSavedList() {
+  const all = tsLocal(), ks = Object.keys(all);
+  if (!ks.length) return "";
+  return `<h3 style="margin:22px 0 8px;font-size:15px">Uložené kurzy</h3><div class="tkhist tssaved">${ks.map((k) => { const r = all[k];
+    return `<div class="card h" data-g="${k}" style="padding:12px"><b>${esc(r.home)} – ${esc(r.away)}</b><br><small class="muted">${r.start ? fmtDay(r.start) + " " + fmtTime(r.start) : ""} · ${r.markets.length} kurzů · načteno ${esc((r.at || "").slice(11, 16))}</small></div>`; }).join("")}</div>`;
+}
+async function sendOdds() {
+  const text = $("tktext").value.trim();
+  if (!TK.img && !text) { $("tkres").innerHTML = `<div class="card"><p class="err">Nahraj screenshot kurzů nebo vlož text.</p></div>`; return; }
+  if (TK.busy) return;
+  TK.busy = true; $("tkgo").disabled = true; $("tkgo").textContent = "Čtu kurzy…";
+  $("tkres").innerHTML = `<div class="card loader"><div class="spinner"></div><b>AI čte kurzy a model počítá hodnotu…</b><p class="help">Obvykle 15–45 vteřin. <b id="tksec">0 s</b></p></div>`;
+  const t0 = Date.now(); const tick = setInterval(() => { const e = $("tksec"); if (e) e.textContent = Math.round((Date.now() - t0) / 1000) + " s"; else clearInterval(tick); }, 1000);
+  try {
+    const r = await fetch("/model/tsodds", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: TK.img, text }) });
+    const j = await r.json();
+    if (!j.games) throw new Error(j.error || "Kurzy se nepodařilo přečíst.");
+    tsSave(j.games);
+    renderOdds(j);
+  } catch (e) {
+    $("tkres").innerHTML = `<div class="card"><p class="err">${esc(e.message)}</p></div>`;
+  }
+  clearInterval(tick);
+  TK.busy = false; $("tkgo").disabled = false; $("tkgo").textContent = "Načíst a spočítat kurzy";
+}
+function renderOdds(j) {
+  const best = j.games.flatMap((g) => g.markets.filter((m) => m.ev > 0.03).map((m) => ({ ...m, g }))).sort((a, b) => b.ev - a.ev).slice(0, 5);
+  $("tkres").innerHTML = `${best.length ? `<div class="card" style="border-color:rgba(53,211,154,.45)"><b>✅ Kurzy, které se podle modelu vyplatí</b>
+      <p class="help" style="margin:4px 0 8px">Seřazeno podle hodnoty.</p>
+      ${best.map((m) => `<div class="gk"><span><b>${esc(m.selection || "")}</b> <small class="muted">${esc(m.market || "")} · ${esc(m.g.home)}–${esc(m.g.away)}</small></span>
+        <span style="text-align:right"><b>${(+m.odds).toFixed(2)}</b> <span class="pill good">+${Math.round(m.ev * 100)} %</span></span></div>`).join("")}</div>`
+    : `<div class="card"><b>Žádný z kurzů se podle modelu výrazně nevyplácí.</b><p class="help">To je u sázkovek normální – mají v kurzech marži. Zkus jiné sázky (střely, body hráčů).</p></div>`}
+    ${j.games.map((g) => `<div class="card" style="margin-top:14px"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="font-size:18px">${esc(g.home)} – ${esc(g.away)}</b><a class="btn" href="#zapas-${g.gameId}">Detail zápasu →</a></div>
+      <small class="muted">${g.start ? fmtDay(g.start) + " " + fmtTime(g.start) : ""} · ${g.markets.length} kurzů</small>${tsTable(g)}</div>`).join("")}
+    ${j.missing?.length ? `<p class="help">Tyhle zápasy jsem nenašel mezi nadcházejícími: ${j.missing.map(esc).join(", ")}.</p>` : ""}`;
+}
 async function sendTicket() {
   const text = $("tktext").value.trim();
   if (!TK.img && !text) { $("tkres").innerHTML = `<div class="card"><p class="err">Nahraj screenshot tiketu nebo vlož jeho text.</p></div>`; return; }
   if (TK.busy) return;
   TK.busy = true; $("tkgo").disabled = true; $("tkgo").textContent = "Vyhodnocuji…";
-  $("tkres").innerHTML = `<div class="card loader"><div class="spinner"></div><b>AI čte tiket a model počítá sázky…</b><p class="help">Trvá to 10–30 vteřin.</p></div>`;
+  $("tkres").innerHTML = `<div class="card loader"><div class="spinner"></div><b>AI čte tiket a model počítá sázky…</b><p class="help">Obvykle 20–60 vteřin (AI tiket nejdřív přečte, pak ho okomentuje). Neodcházej z této stránky. <b id="tksec">0 s</b></p></div>`;
+  const t0 = Date.now(); const tick = setInterval(() => { const e = $("tksec"); if (e) e.textContent = Math.round((Date.now() - t0) / 1000) + " s"; else clearInterval(tick); }, 1000);
   try {
     const r = await fetch("/model/ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ image: TK.img, text }) });
     const j = await r.json();
@@ -4606,6 +5437,7 @@ async function sendTicket() {
   } catch (e) {
     $("tkres").innerHTML = `<div class="card"><p class="err">${esc(e.message)}</p></div>`;
   }
+  clearInterval(tick);
   TK.busy = false; $("tkgo").disabled = false; $("tkgo").textContent = "Vyhodnotit tiket";
 }
 function renderTicket(j) {
@@ -4649,6 +5481,91 @@ function renderTicket(j) {
   $("tkai").onclick = () => { openChat(); sendChat("Mám tento tiket z Tipsportu: " + j.legs.map((x) => `${x.home}–${x.away}: ${x.leg.market} ${x.leg.selection} @ ${x.leg.odds}`).join("; ") + ". Co si o něm myslíš a jak bys ho vylepšil?"); };
 }
 
+
+// ===================================================================
+//  Rozbor zápasů akci po akci (skaut)
+// ===================================================================
+const ZCZ = { crease: "těsně před brankou", slot: "slot", high: "vysoký slot", circles: "z kruhů (z boku)", point: "od modré", behind: "zpoza branky" };
+function halfRink(goals, shots, color, w = 300) {
+  // útočné pásmo: x 25..100 (vodorovně), y -42.5..42.5 (svisle); branka vpravo
+  const S = 4, X = (x) => (x - 25) * S, Y = (y) => (42.5 - y) * S, W = 75 * S, H = 85 * S;
+  const sh = (shots || []).filter((p) => !p[2]).slice(-90).map((p) => `<circle cx="${X(p[0])}" cy="${Y(p[1])}" r="3.4" fill="#64748b" opacity=".45"/>`).join("");
+  const gl = (goals || []).map((p) => `<circle cx="${X(p[0])}" cy="${Y(p[1])}" r="7" fill="${color}" stroke="#05070b" stroke-width="2"><title>${esc((SHOTCZ[p[2]] || p[2] || "") + (p[3] === "PP" ? " · přesilovka" : "") + (p[4] ? " · " + fmtDate(p[4]) : "") + (p[5] ? " vs " + p[5] : ""))}</title></circle>`).join("");
+  return `<svg viewBox="-6 -6 ${W + 12} ${H + 12}" style="width:100%;max-width:${w}px;display:block" xmlns="http://www.w3.org/2000/svg">
+    <path d="M0 0 H${X(72)} A${28 * S} ${28 * S} 0 0 1 ${W} ${28 * S} V${H - 28 * S} A${28 * S} ${28 * S} 0 0 1 ${X(72)} ${H} H0 Z" fill="#eef4fb" stroke="#64748b" stroke-width="3"/>
+    <rect x="0" y="0" width="${S * 1.2}" height="${H}" fill="#2563eb"/>
+    <line x1="${X(89)}" x2="${X(89)}" y1="0" y2="${H}" stroke="#e11d48" stroke-width="2"/>
+    ${[22, -22].map((fy) => `<circle cx="${X(69)}" cy="${Y(fy)}" r="${15 * S}" fill="none" stroke="#e11d48" stroke-width="2" opacity=".7"/><circle cx="${X(69)}" cy="${Y(fy)}" r="3" fill="#e11d48"/>`).join("")}
+    <rect x="${X(69)}" y="${Y(14)}" width="${X(89) - X(69)}" height="${28 * S}" fill="#4cc3ff" opacity=".10"/>
+    <path d="M${X(89)} ${Y(4)} A${6 * S} ${6 * S} 0 0 0 ${X(89)} ${Y(-4)}" fill="#93c5fd" opacity=".8" stroke="#e11d48" stroke-width="2"/>
+    <rect x="${X(89)}" y="${Y(3)}" width="${3.3 * S}" height="${6 * S}" fill="none" stroke="#111" stroke-width="3"/>
+    ${sh}${gl}</svg>`;
+}
+function zoneBars(def) {
+  return `<div class="zbars">${Object.entries(def).map(([z, v]) => { const d = Math.round((v.sogIdx - 1) * 100), w = Math.min(100, Math.max(4, v.sogIdx * 50));
+    return `<div class="zb"><span>${ZCZ[z]}</span><span class="b"><i style="width:${w}%;background:${d > 8 ? "var(--red)" : d < -8 ? "var(--green)" : "#94a3b8"}"></i><em></em></span><b class="${d > 8 ? "noc" : d < -8 ? "okc" : ""}">${d > 0 ? "+" : ""}${d} %</b></div>`; }).join("")}</div>`;
+}
+async function loadScout(d) {
+  const el = $("scout");
+  if (!el) return;
+  let r;
+  try { r = await getJSON("/model/scout?id=" + d.id); } catch (e) { el.innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+  if (r.error) { el.innerHTML = `<div class="card"><p class="help" style="margin:0">${esc(r.error)}</p></div>`; if (r.loading) setTimeout(() => $("scout") && loadScout(d), 20000); return; }
+  const H = r.home, A = r.away, col = (t) => (t === H ? "var(--home)" : "#ffd166");
+  const tcard = (t) => { const x = r.teams[t]; if (!x) return "";
+    const og = x.oppGoalie;
+    return `<div class="card"><b style="font-size:18px;color:${col(t)}">${t} – kde pouští střely</b>
+      <p class="help" style="margin:4px 0 8px">Kolik střel na branku ${t} pouští z každého místa oproti průměru NHL. <b style="color:var(--red)">Červená</b> = slabina (pouští víc), <b style="color:var(--green)">zelená</b> = tam brání dobře.</p>
+      ${zoneBars(x.defense)}
+      <div class="simstats" style="margin-top:12px">
+        <div><small>Inkasované góly</small><b>${x.ga.all}</b><small>v ${x.gp} záp.</small></div>
+        <div><small>z dorážek</small><b>${x.ga.rb}</b></div><div><small>z protiútoků</small><b>${x.ga.ru}</b></div><div><small>v oslabení</small><b>${x.ga.PP}</b></div>
+      </div>
+      <p class="help">Nejčastěji inkasuje: ${x.gaTypes.map(([a, b]) => `<b>${esc(a)}</b> (${b})`).join(", ") || "–"}. Vstřelené góly: ${x.gf.all} (dorážky ${x.gf.rb}, protiútoky ${x.gf.ru}, přesilovky ${x.gf.PP}).</p>
+      ${og && og.zones ? `<p class="help">🧤 Proti ${t} nejspíš chytá <b>${esc(og.name)}</b> (úspěšnost ${og.zones.svp != null ? (og.zones.svp * 100).toFixed(1) + " %" : "–"}). Podle místa střely: ${Object.entries(og.zones.zones).filter(([, v]) => v.sa >= 15).map(([z, v]) => `${ZCZ[z]} <b>${(v.svp * 100).toFixed(1)} %</b>`).join(", ")}.</p>` : ""}</div>`; };
+  el.innerHTML = `
+    <div class="card scoutai" id="scoutai">${r.preview ? `<b>🤖 AI rozbor zápasu</b><div class="airesp">${md(r.preview)}</div>`
+      : `<b>🤖 AI rozbor zápasu</b><p class="help">AI projde rozbor všech střel a gólů obou týmů a napíše, jak bude zápas nejspíš vypadat, kde mají týmy slabiny a od koho čekat gól.</p>
+        <button class="btn primary" id="scoutgo">Napsat AI rozbor</button>`}</div>
+    <div class="grid g2" style="margin-top:14px">${tcard(H)}${tcard(A)}</div>
+    <div class="sechead" style="margin-top:22px"><h2 style="font-size:34px">Jak dávají góly</h2><span class="hint">hráči tohoto zápasu</span></div>
+    <p class="help" style="margin-top:-6px">Mapa = útočné pásmo, branka je vpravo. <b>Barevné tečky</b> = místa, odkud hráč v sezóně dal gól (najeď na ni a uvidíš jak a proti komu), šedé = jeho další střely.
+      <b>Sedí na soupeře</b> = jak moc styl hráče (odkud střílí) odpovídá slabinám obrany a brankáře soupeře. Šipka nahoru = model mu kvůli tomu šanci na gól zvedl.</p>
+    <div class="grid g3">${r.players.slice(0, 9).map((p) => { const pr = p.profile, f = Math.round((p.factor - 1) * 100);
+      return `<div class="card scp">
+        <div style="display:flex;gap:10px;align-items:center">${jersey(p.team, p.num, 44)}<div style="flex:1"><b class="pname-link" data-player="${p.id}:${p.team}">${esc(p.name)}</b><br><small class="muted">${p.team} · ${pr.g} g z ${pr.sog} střel${pr.shPct != null ? ` (${(pr.shPct * 100).toFixed(1)} %)` : ""}</small></div>
+          <div style="text-align:right"><b style="font-size:22px;color:var(--gold)">${pc(p.pGoal)}</b><br><small class="muted">šance na gól</small></div></div>
+        ${halfRink(pr.goals, null, p.team === H ? "#4cc3ff" : "#ffd166")}
+        <div class="chips">${pr.zones.filter((z) => z.g).slice(0, 3).map((z) => `<span class="pill">${esc(z.label)} ${z.g}×</span>`).join("")}${pr.types.filter((t) => t.g).slice(0, 2).map((t) => `<span class="pill">${esc(t.label)} ${t.g}×</span>`).join("")}</div>
+        <p class="help" style="margin:6px 0 0">Dorážky <b>${pr.rebound}</b> · protiútoky <b>${pr.rush}</b> · přesilovky <b>${pr.strength.PP || 0}</b>${pr.avgGoalDist ? ` · průměrně z <b>${Math.round(pr.avgGoalDist * 0.3048)} m</b>` : ""}.
+          Posledních 10 zápasů: <b>${pr.last10.reduce((a, x) => a + x.g, 0)} g</b> / ${pr.last10.reduce((a, x) => a + x.sog, 0)} střel.</p>
+        <p class="help" style="margin:6px 0 0"><span class="pill ${f > 2 ? "good" : f < -2 ? "hot" : ""}">sedí na soupeře ${f > 0 ? "↑ +" : f < 0 ? "↓ " : ""}${f} %</span> ${p.notes.map(esc).join(" · ")}</p>
+      </div>`; }).join("")}</div>`;
+  const b = $("scoutgo");
+  if (b) b.onclick = async () => {
+    b.disabled = true; b.textContent = "AI píše rozbor…";
+    const t0 = Date.now(); const tick = setInterval(() => { if (!b.isConnected) return clearInterval(tick); b.textContent = `AI píše rozbor… ${Math.round((Date.now() - t0) / 1000)} s`; }, 1000);
+    try {
+      const res = await fetch("/model/scoutai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ gameId: d.id }) }).then((x) => x.json());
+      $("scoutai").innerHTML = res.text ? `<b>🤖 AI rozbor zápasu</b><div class="airesp">${md(res.text)}</div>` : `<p class="err">${esc(res.error || "AI neodpověděla.")}</p>`;
+    } catch (e) { $("scoutai").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+    clearInterval(tick);
+  };
+}
+async function playerScout(pid, team) {
+  const el = $("pscout");
+  if (!el) return;
+  let r;
+  try { r = await getJSON("/model/scoutplayer?id=" + pid); } catch (e) { el.innerHTML = ""; return; }
+  if (r.error) { el.innerHTML = `<p class="help">${esc(r.error)}</p>`; return; }
+  el.innerHTML = `<h3 style="margin:18px 0 4px">Jak dává góly (celá sezóna, akce po akci)</h3>
+    <p class="help" style="margin:0 0 8px">Barevné tečky = jeho góly (najeď myší), šedé = ostatní střely. Branka je vpravo.</p>
+    <div class="pscgrid"><div>${halfRink(r.goals, r.shots, tcol(team), 340)}</div>
+    <div><div class="tablewrap" style="background:none"><table class="t"><thead><tr><th class="left">Odkud</th><th>Pokusy</th><th>Na branku</th><th>Góly</th><th>Úspěšnost</th></tr></thead><tbody>
+      ${r.zones.map((z) => `<tr><td class="left">${esc(z.label)}</td><td>${z.att}</td><td>${z.sog}</td><td class="gold">${z.g}</td><td>${z.sh != null ? (z.sh * 100).toFixed(0) + " %" : "–"}</td></tr>`).join("")}</tbody></table></div>
+      <p class="help">Střely: ${r.types.map((t) => `${esc(t.label)} <b>${t.g}</b>/${t.sog}`).join(" · ")}<br>
+        Góly: ${r.g} · z dorážek ${r.rebound} · z protiútoků ${r.rush} · po vhazování ${r.faceoff} · v přesilovce ${r.strength.PP || 0}${r.avgGoalDist ? ` · průměrná vzdálenost gólu ${Math.round(r.avgGoalDist * 0.3048)} m` : ""}.</p></div></div>`;
+}
 // ===================================================================
 //  Analýza hráče (okno)
 // ===================================================================
@@ -4671,6 +5588,7 @@ async function openPlayer(pid, team, nm) {
     </div>
     ${d.next ? `<div class="retro"><b>Další zápas: ${esc(d.next.game)}</b> · šance na bod <b style="color:var(--gold)">${pc(d.next.pPoint)}</b> · na gól ${pc(d.next.pGoal)} · 2+ body ${pc(d.next.p2Points)} · oček. střely ${num(d.next.expShots, 1)}
       <a href="#zapas-${d.next.gid}" onclick="closePlayer()" style="margin-left:8px">rozbor zápasu →</a></div>` : ""}
+    <div id="pscout"></div>
     <h3 style="margin:18px 0 4px">Posledních ${g.length} zápasů</h3>
     <p class="help" style="margin:0 0 6px">Žluté sloupce = kanadské body v zápase, modrá čára = střely na branku. @ = venku.</p>
     ${chart({ labels, bars: [{ name: "Body", color: "#ffc24b", values: g.map((x) => x.pts) }], lines: [{ name: "Střely", color: "#2de2e6", values: g.map((x) => x.sog) }], height: 170 })}
@@ -4681,6 +5599,8 @@ async function openPlayer(pid, team, nm) {
       <button class="btn primary" onclick="closePlayer();openChat();sendChat('Rozeber mi formu hráče ${esc((d.name || nm || "").replace(/'/g, ""))} (${team}) a jeho šance v dalším zápase.')">🤖 AI rozbor hráče</button></div>`;
 }
 function closePlayer() { $("pmodal").classList.add("hidden"); }
+const _openPlayer0 = openPlayer;
+openPlayer = async function (pid, team, nm) { await _openPlayer0(pid, team, nm); playerScout(pid, team); };
 $("pmodal").onclick = (e) => { if (e.target.id === "pmodal") closePlayer(); };
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePlayer(); });
 document.addEventListener("click", (e) => {
