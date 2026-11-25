@@ -2489,6 +2489,839 @@ def analyze_odds(image_b64=None, mime="image/jpeg", text=None):
 # ---------------------------------------------------------------------------
 #  Webový server
 # ---------------------------------------------------------------------------
+# ===========================================================================
+#  VÍCE SPORTŮ: tenis (ATP/WTA), fotbal (LM, EL, KL, Liga národů, ligy), český hokej
+#  Data: ESPN (veřejné JSON, zdarma) + API-Sports hokej (bezplatný klíč API_SPORTS_KEY)
+# ===========================================================================
+ESPN = "https://site.api.espn.com/apis/site/v2/sports/"
+_espn_cache = {}
+_espn_lock = threading.Lock()
+CZ_FLAGS = ("czechia", "czech republic", "cze")
+
+
+def espn(path, ttl=600, store=True):
+    with _espn_lock:
+        hit = _espn_cache.get(path)
+    if hit and (ttl is None or time.time() - hit[0] < ttl):
+        return hit[1]
+    d = json.loads(http_get(ESPN + path, timeout=20))
+    if not store:
+        return d
+    with _espn_lock:
+        _espn_cache[path] = (time.time(), d)
+        if len(_espn_cache) > 6000:
+            for k in sorted(_espn_cache, key=lambda k: _espn_cache[k][0])[:1000]:
+                _espn_cache.pop(k, None)
+    return d
+
+
+def _am2dec(v):
+    """Americký kurz (+150 / -215 / 360) -> desetinný."""
+    try:
+        if isinstance(v, str):
+            v = v.strip().replace("EVEN", "+100")
+            if not v or v.upper() in ("OFF", "N/A"):
+                return None
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x == 0:
+        return None
+    return round(1 + (x / 100 if x > 0 else 100 / -x), 3)
+
+
+def _today_utc():
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _ymd(d):
+    return d.strftime("%Y%m%d")
+
+
+def _dates_between(a, b, step=1):
+    out, d = [], a
+    while d <= b:
+        out.append(d)
+        d += datetime.timedelta(days=step)
+    return out
+
+
+_done_days = set()
+
+
+def _fetch_days(base, days, workers=8):
+    """Stáhne scoreboard pro každý den. Odehrané dny se stáhnou jen jednou (výsledky si drží model, ne cache – šetří paměť)."""
+    today = _today_utc()
+
+    def one(d):
+        old = d < today - datetime.timedelta(days=2)
+        if old and (base, d) in _done_days:
+            return None
+        try:
+            r = espn(f"{base}?dates={_ymd(d)}", 300, store=not old)
+            if old:
+                _done_days.add((base, d))
+            return r
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for k in range(0, len(days), 16):  # po dávkách, ať v paměti není víc stažených dní najednou
+            for r in list(ex.map(one, days[k:k + 16])):
+                if r:
+                    yield r
+
+
+# ---------------------------------------------------------------------------
+#  TENIS
+# ---------------------------------------------------------------------------
+def _t_events(d):
+    ev = d.get("events")
+    if ev is None:
+        ev = []
+        for lg in d.get("leagues") or []:
+            ev += lg.get("events") or []
+    return ev or []
+
+
+def _set_prob_from_match(p, best_of=3):
+    """Najde pravděpodobnost výhry setu s tak, aby šance na zápas (na 2 vítězné sety) byla p."""
+    lo, hi = 0.0, 1.0
+    for _ in range(50):
+        s = (lo + hi) / 2
+        m = s * s * (3 - 2 * s)
+        if m < p:
+            lo = s
+        else:
+            hi = s
+    return (lo + hi) / 2
+
+
+def _sets_dist(s, best_of=3):
+    """Rozdělení výsledku na sety pro hráče A (s = šance A na set)."""
+    q = 1 - s
+    if best_of == 5:
+        return {"3:0": s ** 3, "3:1": 3 * s ** 3 * q, "3:2": 6 * s ** 3 * q * q,
+                "2:3": 6 * q ** 3 * s * s, "1:3": 3 * q ** 3 * s, "0:3": q ** 3}
+    return {"2:0": s * s, "2:1": 2 * s * s * q, "1:2": 2 * q * q * s, "0:2": q * q}
+
+
+def _live_tennis_p(s, sa, sb, best_of=3):
+    """Šance A vyhrát zápas při stavu na sety sa:sb (ignoruje stav gamů)."""
+    need = 3 if best_of == 5 else 2
+    memo = {}
+
+    def f(a, b):
+        if a >= need:
+            return 1.0
+        if b >= need:
+            return 0.0
+        if (a, b) not in memo:
+            memo[(a, b)] = s * f(a + 1, b) + (1 - s) * f(a, b + 1)
+        return memo[(a, b)]
+    return f(sa, sb)
+
+
+class Tennis:
+    def __init__(self, tour):
+        self.tour = tour
+        self.matches = {}   # cid -> zápas
+        self.players = {}   # pid -> info
+        self.elo = {}
+        self.nmatch = {}
+        self.rank = {}
+        self.upcoming = []
+        self.updated = 0
+        self.ready = False
+        self.busy = False
+        self.error = None
+
+    def _parse(self, d):
+        for ev in _t_events(d):
+            major = bool(ev.get("major")) or any(x in (ev.get("name") or "") for x in ("Australian Open", "Roland", "French Open", "Wimbledon", "US Open"))
+            for grp in ev.get("groupings") or []:
+                slug = ((grp.get("grouping") or {}).get("slug") or (grp.get("grouping") or {}).get("displayName") or "").lower()
+                if "single" not in slug and "dvouhra" not in slug:
+                    continue
+                for c in grp.get("competitions") or []:
+                    comps = c.get("competitors") or []
+                    if len(comps) != 2:
+                        continue
+                    ps = []
+                    for x in comps:
+                        a = x.get("athlete") or {}
+                        pid = str(x.get("id") or a.get("id") or a.get("guid") or a.get("displayName"))
+                        flag = a.get("flag") or {}
+                        ps.append({"id": pid, "name": a.get("displayName") or a.get("shortName") or "?", "short": a.get("shortName"),
+                                   "country": flag.get("alt") or a.get("flagAltText"), "flag": flag.get("href"),
+                                   "seed": (x.get("curatedRank") or {}).get("current"), "winner": bool(x.get("winner")),
+                                   "sets": [int(float(l.get("value") or 0)) for l in (x.get("linescores") or [])]})
+                    st = (c.get("status") or {}).get("type") or {}
+                    note = " ".join(n.get("text", "") for n in (c.get("notes") or []))
+                    m = {"id": str(c.get("id")), "date": c.get("date") or c.get("startDate"), "event": ev.get("name") or ev.get("shortName"),
+                         "round": (c.get("round") or {}).get("displayName"), "major": major,
+                         "bo": 5 if major and self.tour == "atp" else 3,
+                         "state": st.get("state"), "completed": bool(st.get("completed")), "detail": st.get("shortDetail") or st.get("description"),
+                         "p": ps, "retired": "ret" in note.lower() or "w/o" in note.lower() or "walkover" in note.lower(),
+                         "court": (c.get("venue") or {}).get("court")}
+                    self.matches[m["id"]] = m
+                    for p in ps:
+                        info = self.players.setdefault(p["id"], {"id": p["id"], "name": p["name"], "country": p["country"], "flag": p["flag"]})
+                        if p["country"]:
+                            info["country"] = p["country"]
+                        if p["flag"]:
+                            info["flag"] = p["flag"]
+
+    def refresh(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            today = _today_utc()
+            start = datetime.date(today.year - 1, 1, 1)
+            days = _dates_between(start, today - datetime.timedelta(days=1), step=4) + _dates_between(today - datetime.timedelta(days=3), today + datetime.timedelta(days=3))
+            for d in _fetch_days(f"tennis/{self.tour}/scoreboard", days):
+                self._parse(d)
+            try:
+                self._parse(espn(f"tennis/{self.tour}/scoreboard", 120))
+            except Exception:
+                pass
+            try:
+                rk = espn(f"tennis/{self.tour}/rankings", 6 * 3600)
+                self._ranks(rk)
+            except Exception as e:
+                print("tenis žebříček:", e, flush=True)
+            self._elo()
+            self.updated = time.time()
+            self.ready = True
+            self.error = None
+        except Exception as e:
+            self.error = str(e)
+            print("tenis", self.tour, e, flush=True)
+        finally:
+            self.busy = False
+
+    def _ranks(self, rk):
+        lst = None
+        for r in rk.get("rankings") or []:
+            lst = r.get("ranks") or r.get("rankings") or r.get("entries")
+            if lst:
+                break
+        if lst is None and isinstance(rk.get("rankings"), list) and rk["rankings"] and "athlete" in rk["rankings"][0]:
+            lst = rk["rankings"]
+        for e in lst or []:
+            a = e.get("athlete") or {}
+            pid = str(a.get("id") or a.get("guid") or a.get("displayName"))
+            flag = a.get("flag") or {}
+            self.rank[pid] = {"rank": e.get("current"), "prev": e.get("previous"), "points": e.get("points"), "name": a.get("displayName"),
+                              "country": flag.get("alt") or a.get("flagAltText") or a.get("citizenshipCountry"), "flag": flag.get("href"), "age": a.get("age")}
+            info = self.players.setdefault(pid, {"id": pid, "name": a.get("displayName"), "country": None, "flag": None})
+            info["country"] = info.get("country") or self.rank[pid]["country"]
+            info["flag"] = info.get("flag") or flag.get("href")
+
+    def _elo(self):
+        elo, n = {}, {}
+        rec = {}
+        done = sorted((m for m in self.matches.values() if m["completed"] and any(p["winner"] for p in m["p"])), key=lambda m: m["date"] or "")
+        for m in done:
+            a, b = m["p"]
+            ea, eb = elo.get(a["id"], 1500.0), elo.get(b["id"], 1500.0)
+            pa = 1 / (1 + 10 ** ((eb - ea) / 400))
+            wa = 1.0 if a["winner"] else 0.0
+            if m["retired"] and sum(sum(p["sets"]) for p in m["p"]) < 6:
+                continue
+            ka = 250 / ((n.get(a["id"], 0) + 5) ** 0.4) * (1.1 if m["major"] else 1)
+            kb = 250 / ((n.get(b["id"], 0) + 5) ** 0.4) * (1.1 if m["major"] else 1)
+            elo[a["id"]] = ea + ka * (wa - pa)
+            elo[b["id"]] = eb + kb * ((1 - wa) - (1 - pa))
+            n[a["id"]] = n.get(a["id"], 0) + 1
+            n[b["id"]] = n.get(b["id"], 0) + 1
+            for p, o, w in ((a, b, wa), (b, a, 1 - wa)):
+                rec.setdefault(p["id"], []).append({"date": (m["date"] or "")[:10], "opp": o["name"], "oppId": o["id"], "oppCountry": o["country"], "win": bool(w),
+                                                    "score": " ".join(f"{x}-{y}" for x, y in zip(p["sets"], o["sets"])), "event": m["event"], "round": m["round"]})
+        # hráči bez zápasů: odhad z žebříčku
+        for pid, r in self.rank.items():
+            if pid not in elo and r.get("rank"):
+                elo[pid] = 1500 + 300 * math.exp(-(r["rank"] - 1) / 60)
+        self.elo, self.nmatch, self.rec = elo, n, rec
+
+    def player_elo(self, pid):
+        e = self.elo.get(pid)
+        if e is None:
+            r = (self.rank.get(pid) or {}).get("rank")
+            e = 1500 + 300 * math.exp(-(r - 1) / 60) if r else 1450
+        n = self.nmatch.get(pid, 0)
+        return e, n
+
+    def predict(self, m):
+        a, b = m["p"]
+        ea, na = self.player_elo(a["id"])
+        eb, nb = self.player_elo(b["id"])
+        p = 1 / (1 + 10 ** ((eb - ea) / 400))
+        s = _set_prob_from_match(p)
+        bo = m.get("bo", 3)
+        pm = _live_tennis_p(s, 0, 0, bo) if bo == 5 else p
+        dist = _sets_dist(s, bo)
+        res = {"pA": round(pm, 4), "pB": round(1 - pm, 4), "setA": round(s, 4), "sets": {k: round(v, 4) for k, v in dist.items()},
+               "eloA": round(ea), "eloB": round(eb), "nA": na, "nB": nb}
+        if bo == 3:
+            res["over25"] = round(dist["2:1"] + dist["1:2"], 4)
+            res["aSet"] = round(1 - dist["0:2"], 4)
+            res["bSet"] = round(1 - dist["2:0"], 4)
+        else:
+            res["over35"] = round(1 - dist["3:0"] - dist["0:3"], 4)
+            res["aSet"] = round(1 - dist["0:3"], 4)
+            res["bSet"] = round(1 - dist["3:0"], 4)
+        if m["state"] == "in":
+            sa = sb = 0
+            for x, y in zip(a["sets"], b["sets"]):
+                if (max(x, y) >= 6 and abs(x - y) >= 2) or max(x, y) == 7:
+                    if x > y:
+                        sa += 1
+                    else:
+                        sb += 1
+            res["live"] = {"setsA": sa, "setsB": sb, "pA": round(_live_tennis_p(s, sa, sb, bo), 4)}
+        return res
+
+    def form(self, pid, n=10):
+        r = (self.rec.get(pid) or [])[-n:]
+        return {"w": sum(1 for x in r if x["win"]), "l": sum(1 for x in r if not x["win"]), "last": [1 if x["win"] else 0 for x in r]}
+
+    def is_cz(self, pid):
+        c = ((self.players.get(pid) or {}).get("country") or (self.rank.get(pid) or {}).get("country") or "").lower()
+        return any(x in c for x in CZ_FLAGS)
+
+    def view(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        lo, hi = (now - datetime.timedelta(hours=30)).isoformat(), (now + datetime.timedelta(days=3)).isoformat()
+        ms = [m for m in self.matches.values() if (m["date"] or "") >= lo[:16] and (m["date"] or "") <= hi[:16] and all(p["name"] not in ("TBD", "?") for p in m["p"])]
+        ms.sort(key=lambda m: ({"in": 0, "pre": 1, "post": 2}.get(m["state"], 3), m["date"] or ""))
+        out = []
+        for m in ms[:160]:
+            pr = self.predict(m)
+            ps = []
+            for p in m["p"]:
+                rk = self.rank.get(p["id"]) or {}
+                ps.append({**{k: p[k] for k in ("id", "name", "country", "flag", "seed", "winner", "sets")}, "rank": rk.get("rank"),
+                           "cz": self.is_cz(p["id"]), "form": self.form(p["id"], 10)})
+            out.append({**{k: m[k] for k in ("id", "date", "event", "round", "state", "detail", "bo", "major", "court")}, "p": ps, "pred": pr})
+        cz = []
+        for pid, info in self.players.items():
+            if not self.is_cz(pid):
+                continue
+            rk = self.rank.get(pid) or {}
+            if not rk.get("rank") and self.nmatch.get(pid, 0) < 5:
+                continue
+            last = (self.rec.get(pid) or [])[-6:][::-1]
+            nxt = next((x for x in out if x["state"] in ("pre", "in") and pid in (x["p"][0]["id"], x["p"][1]["id"])), None)
+            cz.append({"id": pid, "name": info.get("name") or rk.get("name"), "rank": rk.get("rank"), "points": rk.get("points"), "flag": info.get("flag"),
+                       "elo": round(self.player_elo(pid)[0]), "form": self.form(pid, 10), "last": last, "next": nxt and nxt["id"], "age": rk.get("age")})
+        cz.sort(key=lambda x: (x["rank"] or 9999, -x["elo"]))
+        seen = set()
+        cz = [x for x in cz if not ((x["name"] or "").lower() in seen or seen.add((x["name"] or "").lower()))]
+        top = sorted(((pid, e) for pid, e in self.elo.items() if self.nmatch.get(pid, 0) >= 8), key=lambda x: -x[1])[:40]
+        elo_top = [{"id": pid, "name": (self.players.get(pid) or {}).get("name"), "country": (self.players.get(pid) or {}).get("country"),
+                    "flag": (self.players.get(pid) or {}).get("flag"), "elo": round(e), "rank": (self.rank.get(pid) or {}).get("rank"),
+                    "form": self.form(pid, 10), "cz": self.is_cz(pid)} for pid, e in top]
+        return {"tour": self.tour, "matches": out, "czech": cz[:30], "elo": elo_top, "nMatches": len(self.matches), "updated": self.updated}
+
+    def player(self, pid):
+        info = self.players.get(pid) or {}
+        rk = self.rank.get(pid) or {}
+        rec = self.rec.get(pid) or []
+        e, n = self.player_elo(pid)
+        wins = sum(1 for x in rec if x["win"])
+        return {"id": pid, "name": info.get("name") or rk.get("name"), "country": info.get("country"), "flag": info.get("flag"), "rank": rk.get("rank"),
+                "points": rk.get("points"), "age": rk.get("age"), "elo": round(e), "matches": n, "wins": wins, "losses": len(rec) - wins,
+                "last": rec[-25:][::-1], "cz": self.is_cz(pid)}
+
+
+TENNIS = {"atp": Tennis("atp"), "wta": Tennis("wta")}
+
+
+# ---------------------------------------------------------------------------
+#  FOTBAL
+# ---------------------------------------------------------------------------
+FB_LEAGUES = [
+    ("uefa.champions", "Liga mistrů", "club"), ("uefa.europa", "Evropská liga", "club"), ("uefa.europa.conf", "Konferenční liga", "club"),
+    ("cze.1", "Chance Liga (Česko)", "club"), ("eng.1", "Premier League", "club"), ("esp.1", "LaLiga", "club"),
+    ("ger.1", "Bundesliga", "club"), ("ita.1", "Serie A", "club"), ("fra.1", "Ligue 1", "club"),
+    ("uefa.nations", "Liga národů", "nat"), ("fifa.worldq.uefa", "Kvalifikace MS (Evropa)", "nat"), ("fifa.friendly", "Přátelské zápasy", "nat"),
+]
+
+
+def _fb_odds(c):
+    o = (c.get("odds") or [None])[0]
+    if not o:
+        return None
+    ml = o.get("moneyline") or {}
+
+    def pick(side):
+        x = ml.get(side) or {}
+        for k in ("close", "current", "open"):
+            v = (x.get(k) or {}).get("odds")
+            if v:
+                return _am2dec(v)
+        return None
+    h, a, d = pick("home"), pick("away"), pick("draw")
+    if h is None:
+        h = _am2dec((o.get("homeTeamOdds") or {}).get("moneyLine"))
+        a = _am2dec((o.get("awayTeamOdds") or {}).get("moneyLine"))
+    if d is None:
+        d = _am2dec((o.get("drawOdds") or {}).get("moneyLine"))
+    tot = o.get("total") or {}
+    ov = un = None
+    for k in ("close", "current", "open"):
+        ov = ov or _am2dec(((tot.get("over") or {}).get(k) or {}).get("odds"))
+        un = un or _am2dec(((tot.get("under") or {}).get(k) or {}).get("odds"))
+    if not (h and a):
+        return None
+    return {"book": (o.get("provider") or {}).get("name") or "sázkovka", "home": h, "draw": d, "away": a, "ou": o.get("overUnder"), "over": ov, "under": un}
+
+
+class Football:
+    def __init__(self):
+        self.matches = {}  # id -> zápas
+        self.teams = {}
+        self.ready = False
+        self.busy = False
+        self.updated = 0
+        self.model = {}
+        self.error = None
+
+    def _parse(self, d, lg):
+        for ev in d.get("events") or []:
+            c = (ev.get("competitions") or [{}])[0]
+            comps = c.get("competitors") or []
+            if len(comps) != 2:
+                continue
+            side = {}
+            for x in comps:
+                t = x.get("team") or {}
+                stats = {s.get("name"): s.get("displayValue") for s in (x.get("statistics") or [])}
+                side[x.get("homeAway")] = {"id": str(t.get("id")), "name": t.get("displayName") or t.get("name"), "short": t.get("shortDisplayName") or t.get("abbreviation"),
+                                           "abbr": t.get("abbreviation"), "logo": t.get("logo"), "score": x.get("score"), "form": x.get("form"),
+                                           "shots": stats.get("totalShots"), "sot": stats.get("shotsOnTarget"), "poss": stats.get("possessionPct"), "corners": stats.get("wonCorners")}
+            if "home" not in side or "away" not in side:
+                continue
+            st = (c.get("status") or ev.get("status") or {}).get("type") or {}
+            m = {"id": str(ev.get("id")), "league": lg, "date": ev.get("date"), "state": st.get("state"), "completed": bool(st.get("completed")),
+                 "detail": st.get("shortDetail") or st.get("description"), "clock": (c.get("status") or {}).get("displayClock"),
+                 "home": side["home"], "away": side["away"], "odds": _fb_odds(c), "neutral": bool(c.get("neutralSite")),
+                 "venue": (c.get("venue") or {}).get("fullName"), "note": (c.get("notes") or [{}])[0].get("headline") if c.get("notes") else None}
+            self.matches[m["id"]] = m
+            for s in (side["home"], side["away"]):
+                self.teams[s["id"]] = {"id": s["id"], "name": s["name"], "short": s["short"], "logo": s["logo"]}
+
+    def refresh(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            today = _today_utc()
+            for code, name, kind in FB_LEAGUES:
+                try:
+                    cur = espn(f"soccer/{code}/scoreboard", 300)
+                except Exception as e:
+                    print("fotbal", code, e, flush=True)
+                    continue
+                self._parse(cur, code)
+                cal = []
+                for lg in cur.get("leagues") or []:
+                    for x in lg.get("calendar") or []:
+                        v = x if isinstance(x, str) else (x.get("startDate") or x.get("value") if isinstance(x, dict) else None)
+                        if v:
+                            try:
+                                cal.append(datetime.date.fromisoformat(v[:10]))
+                            except ValueError:
+                                pass
+                horizon = today + datetime.timedelta(days=10)
+                back = today - datetime.timedelta(days=420 if kind == "nat" else 150)
+                days = sorted({d for d in cal if back <= d <= horizon})
+                if not days:
+                    days = _dates_between(max(back, today - datetime.timedelta(days=120)), horizon, step=1 if kind == "club" else 3)
+                for d in _fetch_days(f"soccer/{code}/scoreboard", days, workers=6):
+                    self._parse(d, code)
+            self._fit()
+            self.updated = time.time()
+            self.ready = True
+            self.error = None
+        except Exception as e:
+            self.error = str(e)
+            print("fotbal", e, flush=True)
+        finally:
+            self.busy = False
+
+    def _fit(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        games = []
+        for m in self.matches.values():
+            if not m["completed"]:
+                continue
+            try:
+                hg, ag = int(m["home"]["score"]), int(m["away"]["score"])
+                age = (now - datetime.datetime.fromisoformat(m["date"].replace("Z", "+00:00"))).days
+            except Exception:
+                continue
+            w = 0.5 ** (max(0, age) / 90)
+            games.append((m["home"]["id"], m["away"]["id"], hg, ag, w, m["neutral"]))
+        att, dfn = {}, {}
+        for h, a, *_ in games:
+            att.setdefault(h, 1.0); att.setdefault(a, 1.0); dfn.setdefault(h, 1.0); dfn.setdefault(a, 1.0)
+        tot_w = sum(g[4] for g in games) or 1
+        mu = sum((g[2] + g[3]) * g[4] for g in games) / (2 * tot_w) if games else 1.35
+        home = 1.2
+        prior = 4.0
+        for _ in range(40):
+            na, da = {t: [prior, prior] for t in att}, {t: [prior, prior] for t in att}
+            hs, hx = 0.0, 0.0
+            for h, a, hg, ag, w, neu in games:
+                hf = 1.0 if neu else home
+                na[h][0] += w * hg; na[h][1] += w * mu * hf * dfn[a]
+                na[a][0] += w * ag; na[a][1] += w * mu * dfn[h]
+                da[a][0] += w * hg; da[a][1] += w * mu * hf * att[h]
+                da[h][0] += w * ag; da[h][1] += w * mu * att[a]
+                if not neu:
+                    hs += w * hg; hx += w * mu * att[h] * dfn[a]
+            att = {t: v[0] / v[1] for t, v in na.items()}
+            dfn = {t: v[0] / v[1] for t, v in da.items()}
+            home = _clamp(hs / hx, 1.0, 1.5) if hx else 1.2
+        ng = {}
+        for h, a, *_ in games:
+            ng[h] = ng.get(h, 0) + 1; ng[a] = ng.get(a, 0) + 1
+        self.model = {"att": att, "def": dfn, "mu": mu, "home": home, "n": ng}
+
+    def predict(self, m):
+        M = self.model
+        if not M:
+            return None
+        h, a = m["home"]["id"], m["away"]["id"]
+        hf = 1.0 if m["neutral"] else M["home"]
+        lh = M["mu"] * hf * M["att"].get(h, 0.9) * M["def"].get(a, 1.1)
+        la = M["mu"] * M["att"].get(a, 0.9) * M["def"].get(h, 1.1)
+        rho = -0.08
+        mat = {}
+        for i in range(11):
+            for j in range(11):
+                p = _pmf(i, lh) * _pmf(j, la)
+                if i == 0 and j == 0:
+                    p *= 1 - lh * la * rho
+                elif i == 0 and j == 1:
+                    p *= 1 + lh * rho
+                elif i == 1 and j == 0:
+                    p *= 1 + la * rho
+                elif i == 1 and j == 1:
+                    p *= 1 - rho
+                mat[(i, j)] = p
+        s = sum(mat.values())
+        mat = {k: v / s for k, v in mat.items()}
+        pH = sum(v for (i, j), v in mat.items() if i > j)
+        pD = sum(v for (i, j), v in mat.items() if i == j)
+        pA = 1 - pH - pD
+        ou = {L: round(sum(v for (i, j), v in mat.items() if i + j > L), 4) for L in (0.5, 1.5, 2.5, 3.5, 4.5)}
+        btts = sum(v for (i, j), v in mat.items() if i > 0 and j > 0)
+        cs = sorted(mat.items(), key=lambda kv: -kv[1])[:6]
+        nh, na = M["n"].get(h, 0), M["n"].get(a, 0)
+        res = {"xgH": round(lh, 2), "xgA": round(la, 2), "model": {"1": round(pH, 4), "X": round(pD, 4), "2": round(pA, 4)},
+               "ou": ou, "btts": round(btts, 4), "cs": [[f"{i}:{j}", round(v, 4)] for (i, j), v in cs],
+               "hTeam": {"over05": round(1 - _pmf(0, lh), 4), "over15": round(1 - _pmf(0, lh) - _pmf(1, lh), 4)},
+               "aTeam": {"over05": round(1 - _pmf(0, la), 4), "over15": round(1 - _pmf(0, la) - _pmf(1, la), 4)},
+               "games": [nh, na], "thin": min(nh, na) < 5}
+        o = m.get("odds")
+        fin = dict(res["model"])
+        if o and o.get("draw"):
+            inv = {"1": 1 / o["home"], "X": 1 / o["draw"], "2": 1 / o["away"]}
+            ssum = sum(inv.values())
+            mk = {k: v / ssum for k, v in inv.items()}
+            wm = 0.35 if res["thin"] else 0.6
+            fin = {k: round(wm * res["model"][k] + (1 - wm) * mk[k], 4) for k in mk}
+            res["market"] = {k: round(v, 4) for k, v in mk.items()}
+            res["margin"] = round(ssum - 1, 4)
+            res["ev"] = {"1": round(fin["1"] * o["home"] - 1, 4), "X": round(fin["X"] * o["draw"] - 1, 4), "2": round(fin["2"] * o["away"] - 1, 4)}
+            if o.get("ou") == 2.5 and o.get("over") and o.get("under"):
+                res["evOU"] = {"over": round(ou[2.5] * o["over"] - 1, 4), "under": round((1 - ou[2.5]) * o["under"] - 1, 4)}
+        res["final"] = fin
+        res["dc"] = {"1X": round(fin["1"] + fin["X"], 4), "X2": round(fin["X"] + fin["2"], 4), "12": round(fin["1"] + fin["2"], 4)}
+        return res
+
+    def team_form(self, tid, n=5):
+        ms = sorted((m for m in self.matches.values() if m["completed"] and tid in (m["home"]["id"], m["away"]["id"])), key=lambda m: m["date"] or "")[-n:]
+        out = []
+        for m in ms:
+            me, op = (m["home"], m["away"]) if m["home"]["id"] == tid else (m["away"], m["home"])
+            try:
+                a, b = int(me["score"]), int(op["score"])
+            except Exception:
+                continue
+            out.append({"r": "V" if a > b else "R" if a == b else "P", "s": f"{a}:{b}", "opp": op["short"] or op["name"], "date": (m["date"] or "")[:10], "lg": m["league"]})
+        return out
+
+    def team_stats(self, tid):
+        ms = [m for m in self.matches.values() if m["completed"] and tid in (m["home"]["id"], m["away"]["id"])]
+        sh, sot, poss, n = 0.0, 0.0, 0.0, 0
+        for m in ms[-12:]:
+            me = m["home"] if m["home"]["id"] == tid else m["away"]
+            try:
+                sh += float(me["shots"]); sot += float(me["sot"] or 0); poss += float(me["poss"] or 0); n += 1
+            except (TypeError, ValueError):
+                pass
+        return {"shots": round(sh / n, 1), "sot": round(sot / n, 1), "poss": round(poss / n, 1)} if n else None
+
+    def table(self, lg):
+        T = {}
+        for m in self.matches.values():
+            if m["league"] != lg or not m["completed"]:
+                continue
+            try:
+                hg, ag = int(m["home"]["score"]), int(m["away"]["score"])
+            except Exception:
+                continue
+            for me, op, gf, ga in ((m["home"], m["away"], hg, ag), (m["away"], m["home"], ag, hg)):
+                r = T.setdefault(me["id"], {"id": me["id"], "name": me["short"] or me["name"], "logo": me["logo"], "gp": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0})
+                r["gp"] += 1; r["gf"] += gf; r["ga"] += ga
+                if gf > ga:
+                    r["w"] += 1; r["pts"] += 3
+                elif gf == ga:
+                    r["d"] += 1; r["pts"] += 1
+                else:
+                    r["l"] += 1
+        return sorted(T.values(), key=lambda r: (-r["pts"], -(r["gf"] - r["ga"]), -r["gf"]))
+
+    def view(self, lg):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        lo, hi = (now - datetime.timedelta(hours=30)).isoformat()[:16], (now + datetime.timedelta(days=8)).isoformat()[:16]
+        ms = [m for m in self.matches.values() if m["league"] == lg and lo <= (m["date"] or "") <= hi]
+        ms.sort(key=lambda m: ({"in": 0, "pre": 1, "post": 2}.get(m["state"], 3), m["date"] or ""))
+        out = []
+        for m in ms[:60]:
+            out.append({**m, "pred": self.predict(m), "formH": self.team_form(m["home"]["id"]), "formA": self.team_form(m["away"]["id"]),
+                        "statsH": self.team_stats(m["home"]["id"]), "statsA": self.team_stats(m["away"]["id"])})
+        name = next((n for c, n, k in FB_LEAGUES if c == lg), lg)
+        kind = next((k for c, n, k in FB_LEAGUES if c == lg), "club")
+        return {"league": lg, "name": name, "matches": out, "table": self.table(lg) if kind == "club" and not lg.startswith("uefa") else [],
+                "leagues": [{"code": c, "name": n} for c, n, k in FB_LEAGUES], "updated": self.updated}
+
+
+FOOTBALL = Football()
+
+
+# ---------------------------------------------------------------------------
+#  ČESKÝ HOKEJ (API-Sports, bezplatný klíč)
+# ---------------------------------------------------------------------------
+APISPORTS_HOCKEY = "https://v1.hockey.api-sports.io/"
+_aps_cache = {}
+
+
+def aps_key():
+    return os.environ.get("API_SPORTS_KEY", "").strip()
+
+
+def aps(path, ttl):
+    hit = _aps_cache.get(path)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    d = json.loads(http_get(APISPORTS_HOCKEY + path, headers={"x-apisports-key": aps_key()}, timeout=25))
+    if d.get("errors") and not d.get("response"):
+        raise RuntimeError(str(d["errors"])[:200])
+    _aps_cache[path] = (time.time(), d)
+    return d
+
+
+CZH_WANT = [("extraliga", "Tipsport extraliga"), ("maxa|chance|1\\. liga|1 liga", "Maxa liga")]
+CZH_LIVE = ("P1", "P2", "P3", "OT", "PT", "BT", "LIVE")
+CZH_DONE = ("FT", "AOT", "AP")
+
+
+class CzHockey:
+    def __init__(self):
+        self.leagues = {}  # key -> {"id", "season", "name"}
+        self.games = {}
+        self.ready = False
+        self.busy = False
+        self.updated = 0
+        self.error = None
+        self.model = {}
+
+    def refresh(self):
+        if self.busy:
+            return
+        if not aps_key():
+            self.error = "nokey"
+            return
+        self.busy = True
+        try:
+            d = aps("leagues?country=Czech-Republic", 24 * 3600)
+            for key, (pat, nice) in enumerate(CZH_WANT):
+                for x in d.get("response") or []:
+                    nm = (x.get("name") or "")
+                    if re.search(pat, nm, re.I) and not re.search("women|u20|u18|ženy|junior|cup|pohár", nm, re.I):
+                        seasons = x.get("seasons") or []
+                        cur = next((s for s in seasons if s.get("current")), None) or (seasons[-1] if seasons else None)
+                        if cur:
+                            self.leagues[nice] = {"id": x.get("id"), "season": cur.get("season"), "name": nice, "logo": x.get("logo")}
+                        break
+            for nice, L in self.leagues.items():
+                g = aps(f"games?league={L['id']}&season={L['season']}", 30 * 60)
+                for x in g.get("response") or []:
+                    st = (x.get("status") or {}).get("short")
+                    per = x.get("periods") or {}
+
+                    def reg(side):
+                        tot = 0
+                        for k in ("first", "second", "third"):
+                            v = per.get(k)
+                            if v and "-" in str(v):
+                                try:
+                                    tot += int(str(v).split("-")[0 if side == "home" else 1])
+                                except ValueError:
+                                    pass
+                        return tot
+                    sc = x.get("scores") or {}
+                    self.games[x["id"]] = {"id": x["id"], "league": nice, "date": x.get("date"), "status": st, "statusLong": (x.get("status") or {}).get("long"),
+                                           "home": {"id": x["teams"]["home"]["id"], "name": x["teams"]["home"]["name"], "logo": x["teams"]["home"].get("logo"), "score": sc.get("home")},
+                                           "away": {"id": x["teams"]["away"]["id"], "name": x["teams"]["away"]["name"], "logo": x["teams"]["away"].get("logo"), "score": sc.get("away")},
+                                           "regH": reg("home"), "regA": reg("away"), "periods": per}
+            self._fit()
+            self.updated = time.time()
+            self.ready = True
+            self.error = None
+        except Exception as e:
+            self.error = str(e)
+            print("český hokej:", e, flush=True)
+        finally:
+            self.busy = False
+
+    def _fit(self):
+        self.model = {}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for nice in self.leagues:
+            gs = []
+            for g in self.games.values():
+                if g["league"] != nice or g["status"] not in CZH_DONE:
+                    continue
+                try:
+                    age = (now - datetime.datetime.fromisoformat(g["date"])).days
+                except Exception:
+                    age = 30
+                gs.append((g["home"]["id"], g["away"]["id"], g["regH"], g["regA"], 0.5 ** (max(0, age) / 60)))
+            if not gs:
+                continue
+            tw = sum(x[4] for x in gs)
+            mu = sum((x[2] + x[3]) * x[4] for x in gs) / (2 * tw)
+            att = {t: 1.0 for x in gs for t in x[:2]}
+            dfn = dict(att)
+            home = 1.1
+            for _ in range(40):
+                na = {t: [3.0, 3.0] for t in att}; da = {t: [3.0, 3.0] for t in att}
+                hs = hx = 0.0
+                for h, a, hg, ag, w in gs:
+                    na[h][0] += w * hg; na[h][1] += w * mu * home * dfn[a]
+                    na[a][0] += w * ag; na[a][1] += w * mu * dfn[h]
+                    da[a][0] += w * hg; da[a][1] += w * mu * home * att[h]
+                    da[h][0] += w * ag; da[h][1] += w * mu * att[a]
+                    hs += w * hg; hx += w * mu * att[h] * dfn[a]
+                att = {t: v[0] / v[1] for t, v in na.items()}
+                dfn = {t: v[0] / v[1] for t, v in da.items()}
+                home = _clamp(hs / hx, 1.0, 1.35)
+            self.model[nice] = {"mu": mu, "att": att, "def": dfn, "home": home}
+
+    def predict(self, g):
+        M = self.model.get(g["league"])
+        if not M:
+            return None
+        h, a = g["home"]["id"], g["away"]["id"]
+        lh = M["mu"] * M["home"] * M["att"].get(h, 1) * M["def"].get(a, 1)
+        la = M["mu"] * M["att"].get(a, 1) * M["def"].get(h, 1)
+        pH = pD = 0.0
+        tot = {}
+        for i in range(13):
+            for j in range(13):
+                p = _pmf(i, lh) * _pmf(j, la)
+                if i > j:
+                    pH += p
+                elif i == j:
+                    pD += p
+                tot[i + j] = tot.get(i + j, 0) + p
+        pA = 1 - pH - pD
+        ot_h = _clamp(0.5 + (pH - pA) * 0.35, 0.3, 0.7)
+        return {"xgH": round(lh, 2), "xgA": round(la, 2), "reg": {"1": round(pH, 4), "0": round(pD, 4), "2": round(pA, 4)},
+                "win": {"home": round(pH + pD * ot_h, 4), "away": round(pA + pD * (1 - ot_h), 4)},
+                "ou": {L: round(sum(v for t, v in tot.items() if t > L), 4) for L in (3.5, 4.5, 5.5, 6.5)}}
+
+    def table(self, nice):
+        T = {}
+        for g in self.games.values():
+            if g["league"] != nice or g["status"] not in CZH_DONE:
+                continue
+            hs, as_ = g["home"]["score"] or 0, g["away"]["score"] or 0
+            ot = g["status"] in ("AOT", "AP")
+            for me, gf, ga in ((g["home"], hs, as_), (g["away"], as_, hs)):
+                r = T.setdefault(me["id"], {"id": me["id"], "name": me["name"], "logo": me["logo"], "gp": 0, "w": 0, "otw": 0, "otl": 0, "l": 0, "gf": 0, "ga": 0, "pts": 0})
+                r["gp"] += 1; r["gf"] += gf; r["ga"] += ga
+                if gf > ga:
+                    r["otw" if ot else "w"] += 1; r["pts"] += 2 if ot else 3
+                else:
+                    r["otl" if ot else "l"] += 1; r["pts"] += 1 if ot else 0
+        return sorted(T.values(), key=lambda r: (-r["pts"], -(r["gf"] - r["ga"])))
+
+    def form(self, tid, n=5):
+        gs = sorted((g for g in self.games.values() if g["status"] in CZH_DONE and tid in (g["home"]["id"], g["away"]["id"])), key=lambda g: g["date"] or "")[-n:]
+        out = []
+        for g in gs:
+            me, op = (g["home"], g["away"]) if g["home"]["id"] == tid else (g["away"], g["home"])
+            out.append({"r": "V" if (me["score"] or 0) > (op["score"] or 0) else "P", "s": f"{me['score']}:{op['score']}", "opp": op["name"], "ot": g["status"] in ("AOT", "AP")})
+        return out
+
+    def view(self, nice):
+        if not aps_key():
+            return {"nokey": True}
+        if not self.ready:
+            return {"loading": True, "error": self.error}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        lo, hi = (now - datetime.timedelta(hours=30)).isoformat(), (now + datetime.timedelta(days=8)).isoformat()
+        gs = [g for g in self.games.values() if g["league"] == nice and lo[:16] <= (g["date"] or "")[:16] <= hi[:16]]
+        gs.sort(key=lambda g: (0 if g["status"] in CZH_LIVE else 1 if g["status"] == "NS" else 2, g["date"] or ""))
+        return {"league": nice, "leagues": list(self.leagues), "matches": [{**g, "pred": self.predict(g), "formH": self.form(g["home"]["id"]), "formA": self.form(g["away"]["id"])} for g in gs[:40]],
+                "table": self.table(nice), "updated": self.updated}
+
+
+CZHOCKEY = CzHockey()
+
+
+def sports_refresher():
+    """Obnovuje data ostatních sportů na pozadí."""
+    time.sleep(20)
+    while True:
+        for job in (TENNIS["atp"].refresh, TENNIS["wta"].refresh, FOOTBALL.refresh, CZHOCKEY.refresh):
+            try:
+                job()
+            except Exception as e:
+                print("sporty:", e, flush=True)
+        time.sleep(30 * 60)
+
+
+def sports_api(path, q):
+    """Vrátí JSON pro /sport/... endpointy."""
+    if path == "/sport/tennis":
+        tour = q.get("tour", ["atp"])[0]
+        T = TENNIS.get(tour)
+        if not T:
+            return {"error": "neznámá túra"}
+        if not T.ready:
+            return {"loading": True, "error": T.error}
+        return T.view()
+    if path == "/sport/tennisplayer":
+        T = TENNIS.get(q.get("tour", ["atp"])[0])
+        return T.player(q.get("id", [""])[0]) if T and T.ready else {"loading": True}
+    if path == "/sport/football":
+        lg = q.get("league", ["uefa.champions"])[0]
+        if not FOOTBALL.ready:
+            return {"loading": True, "error": FOOTBALL.error, "leagues": [{"code": c, "name": n} for c, n, k in FB_LEAGUES]}
+        return FOOTBALL.view(lg)
+    if path == "/sport/czhockey":
+        return CZHOCKEY.view(q.get("league", ["Tipsport extraliga"])[0])
+    return {"error": "neznámý sport"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -2554,6 +3387,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/ping":
             LEAGUE.ensure()
             self._send(200, b"ok", "text/plain")
+            return
+        if u.path.startswith("/sport/"):
+            try:
+                self._json(sports_api(u.path, q))
+            except Exception as e:
+                self._json({"error": f"Chyba: {e}"}, 500)
             return
         if u.path in ("/model/scout", "/model/scoutplayer"):
             try:
@@ -2752,6 +3591,7 @@ def keep_alive():
 def main():
     LEAGUE.ensure()  # začni stahovat data hned po startu
     keep_alive()
+    threading.Thread(target=sports_refresher, daemon=True).start()
     if os.environ.get("PORT"):
         port = int(os.environ["PORT"])
         server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
@@ -3510,6 +4350,40 @@ body.rails-on .hrail { display: none; }
 .lbin { width: 78px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line2); background: rgba(255,255,255,.06); color: var(--text); font: inherit; font-weight: 800; text-align: center; }
 .lbet { border-color: rgba(53,211,154,.35); }
 @media (max-width: 720px) { .lbet th:nth-child(3), .lbet td:nth-child(3) { display: none; } .lbet td, .lbet th { padding-left: 6px; padding-right: 6px; } .lbin { width: 64px; } }
+
+.sporthero { padding: 50px 40px 34px; background: radial-gradient(700px 300px at 80% 0%, rgba(76,195,255,.18), transparent 70%), linear-gradient(180deg, #0b111b, #05070b); }
+.sporthero.ten { background: radial-gradient(700px 320px at 85% 10%, rgba(206,255,70,.18), transparent 70%), linear-gradient(160deg, #0b1a12, #05070b 70%); }
+.sporthero.fb { background: radial-gradient(700px 320px at 85% 10%, rgba(53,211,154,.2), transparent 70%), linear-gradient(160deg, #06160f, #05070b 70%); }
+.sporthero.czh { background: radial-gradient(700px 320px at 85% 10%, rgba(255,45,61,.2), transparent 70%), linear-gradient(160deg, #1a0709, #05070b 70%); }
+.sporthero h1 span { display: block; color: var(--cyan); }
+.sporthero .seg { margin-top: 16px; }
+.flag { width: 22px; height: 15px; object-fit: cover; border-radius: 3px; vertical-align: middle; box-shadow: 0 0 0 1px rgba(255,255,255,.2); }
+.czgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.czc { border-color: rgba(255,45,61,.35); background: linear-gradient(160deg, rgba(47,123,255,.12), rgba(255,45,61,.08) 60%, rgba(12,16,23,.9)); cursor: pointer; }
+.czc .row1 { display: flex; gap: 8px; align-items: center; font-size: 18px; } .czc .row1 .pill { margin-left: auto; }
+.big3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 10px 0 6px; } .big3 small { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.big3 b { font-family: Anton, Impact, sans-serif; font-size: 26px; font-weight: 400; }
+.tl { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; padding: 3px 0; border-top: 1px dashed var(--line); } .tl small { color: var(--muted); text-align: right; }
+.tcard.czm { border-color: rgba(255,45,61,.45); box-shadow: 0 0 0 1px rgba(255,45,61,.2), 0 14px 40px rgba(0,0,0,.45); }
+.thead { display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; }
+.livebadge { color: var(--red); font-weight: 900; }
+.tp { display: grid; grid-template-columns: auto 1fr auto auto; gap: 8px; align-items: center; padding: 6px 0; }
+.tp > small { grid-column: 2; grid-row: 2; margin-top: -4px; } .tp.win b.pname-link { color: var(--gold); } .tp.cz b.pname-link::after { content: " 🇨🇿"; }
+.tp .sets { display: flex; gap: 4px; } .tp .sets i { font-style: normal; font-weight: 800; min-width: 18px; text-align: center; background: rgba(255,255,255,.08); border-radius: 4px; }
+.tp .pp { font-size: 18px; color: var(--gold); }
+.pbar3 { display: flex; height: 26px; border-radius: 8px; overflow: hidden; margin-top: 8px; gap: 2px; }
+.pbar3 > div { display: flex; align-items: center; justify-content: center; min-width: 0; color: #05070b; font-weight: 900; font-size: 12px; white-space: nowrap; overflow: hidden; }
+.oins { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; } .oin { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,.04); border: 1px solid var(--line); border-radius: 10px; padding: 5px 8px; }
+.oin small { color: var(--muted); font-size: 11.5px; } .oin .lbin { width: 64px; }
+.lgchips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; } .chip { padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line2); color: var(--text); text-decoration: none; font-weight: 700; font-size: 14px; }
+.chip.on { background: #fff; color: #05070b; border-color: #fff; }
+.fbt { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; } .fbt img { width: 34px; height: 34px; object-fit: contain; }
+.fbt b { display: block; } .fbt small { display: block; font-size: 11.5px; } .fbt .sc { font-family: Anton, Impact, sans-serif; font-size: 30px; }
+.form { display: inline-flex; gap: 3px; margin-top: 3px; } .fr { font-style: normal; font-size: 10px; font-weight: 900; width: 17px; height: 17px; display: grid; place-items: center; border-radius: 4px; background: #475569; color: #fff; }
+.fr.V { background: var(--green); color: #05070b; } .fr.P { background: var(--red); } .fr.R { background: #94a3b8; color: #05070b; }
+.tlogo { width: 20px; height: 20px; object-fit: contain; vertical-align: middle; } tr.czrow td { background: rgba(255,45,61,.07); }
+@media (max-width: 720px) { .sporthero { padding: 34px 16px 24px; } .oin small { font-size: 10.5px; } }
+.sporthero h1.display { font-size: clamp(44px, 7vw, 100px) !important; line-height: 1.02; }
 </style>
 </head>
 <body>
@@ -3523,6 +4397,9 @@ body.rails-on .hrail { display: none; }
     <a href="#live" id="nav-live"><span class="livedot"></span> Live</a>
     <a href="#presnost" id="nav-acc">🎯 Přesnost</a>
     <a href="#tikety" id="nav-tk">🎫 Tikety</a>
+    <a href="#tenis" id="nav-ten">🎾 Tenis</a>
+    <a href="#fotbal" id="nav-fb">⚽ Fotbal</a>
+    <a href="#hokejcz" id="nav-czh">🏒 Extraliga</a>
     <a href="#karta" id="nav-card">🪪 NHL ID</a>
     <a href="#statistiky" id="nav-stats">📊 Statistiky</a>
   </nav>
@@ -3535,6 +4412,7 @@ body.rails-on .hrail { display: none; }
   <section id="view-acc" class="hidden"></section>
   <section id="view-card" class="hidden"></section>
   <section id="view-tk" class="hidden"></section>
+  <section id="view-sport" class="hidden"></section>
   <section id="view-stats" class="hidden">
     <div class="thead" style="margin-top:26px"><img id="slogo" alt=""><div><h1 class="page" id="stitle" style="margin:0">Statistiky týmu</h1><div class="sub" id="ssub"></div></div></div>
     <div class="controls">
@@ -4056,7 +4934,11 @@ function route() {
   const acc = h === "#presnost";
   const card = h.startsWith("#karta");
   const tk = h === "#tikety";
-  const over = !game && !stats && !live && !acc && !card && !tk;
+  const ten = h.startsWith("#tenis"), fb = h.startsWith("#fotbal"), czh = h.startsWith("#hokejcz");
+  const sport = ten || fb || czh;
+  const over = !game && !stats && !live && !acc && !card && !tk && !sport;
+  $("view-sport").classList.toggle("hidden", !sport);
+  $("nav-ten").classList.toggle("on", ten); $("nav-fb").classList.toggle("on", fb); $("nav-czh").classList.toggle("on", czh);
   $("view-tk").classList.toggle("hidden", !tk);
   $("nav-tk").classList.toggle("on", tk);
   $("view-card").classList.toggle("hidden", !card);
@@ -4081,6 +4963,9 @@ function route() {
   else if (acc) loadAcc();
   else if (card) openCard(h.slice(7));
   else if (tk) openTickets();
+  else if (ten) openTennis(h.slice(7) || "atp");
+  else if (fb) openFootball(decodeURIComponent(h.slice(8)) || "uefa.champions");
+  else if (czh) openCzHockey(decodeURIComponent(h.slice(9)) || "Tipsport extraliga");
   else loadOverview();
   window.scrollTo(0, 0);
 }
@@ -5793,6 +6678,194 @@ async function playerScout(pid, team) {
       ${r.zones.map((z) => `<tr><td class="left">${esc(z.label)}</td><td>${z.att}</td><td>${z.sog}</td><td class="gold">${z.g}</td><td>${z.sh != null ? (z.sh * 100).toFixed(0) + " %" : "–"}</td></tr>`).join("")}</tbody></table></div>
       <p class="help">Střely: ${r.types.map((t) => `${esc(t.label)} <b>${t.g}</b>/${t.sog}`).join(" · ")}<br>
         Góly: ${r.g} · z dorážek ${r.rebound} · z protiútoků ${r.rush} · po vhazování ${r.faceoff} · v přesilovce ${r.strength.PP || 0}${r.avgGoalDist ? ` · průměrná vzdálenost gólu ${Math.round(r.avgGoalDist * 0.3048)} m` : ""}.</p></div></div>`;
+}
+
+// ===================================================================
+//  VÍCE SPORTŮ – tenis, fotbal, český hokej
+// ===================================================================
+const SP = { tour: "atp", czOnly: false, poll: null };
+function oddsIn(key, p, label) {
+  const v = store.get("todd:" + key) || "";
+  const o = parseFloat(v), ev = o > 1 && p ? p * o - 1 : null;
+  return `<span class="oin"><small>${esc(label)}</small><input class="lbin" data-ok="${esc(key)}" data-p="${p}" inputmode="decimal" placeholder="kurz" value="${esc(v)}"><b class="oev">${ev == null ? "" : `<span class="pill ${ev > 0.03 ? "good" : ev < -0.03 ? "hot" : ""}">${ev > 0 ? "+" : ""}${Math.round(ev * 100)} %</span>`}</b></span>`;
+}
+document.addEventListener("input", (e) => {
+  const i = e.target.closest && e.target.closest("[data-ok]");
+  if (!i) return;
+  store.set("todd:" + i.dataset.ok, i.value.replace(",", "."));
+  const o = parseFloat(i.value.replace(",", ".")), p = +i.dataset.p, ev = o > 1 && p ? p * o - 1 : null;
+  i.parentElement.querySelector(".oev").innerHTML = ev == null ? "" : `<span class="pill ${ev > 0.03 ? "good" : ev < -0.03 ? "hot" : ""}">${ev > 0 ? "+" : ""}${Math.round(ev * 100)} %</span>`;
+});
+const fairO = (p) => (p > 0.01 ? (1 / p).toFixed(2) : "–");
+const flagImg = (href, alt) => (href && href.startsWith("http") ? `<img class="flag" src="${esc(href)}" alt="${esc(alt || "")}" title="${esc(alt || "")}">` : "");
+const dots = (arr) => `<span class="dots">${(arr || []).map((x) => `<i class="${x ? "y" : ""}"></i>`).join("")}</span>`;
+const pbar = (items) => `<div class="pbar3">${items.map(([lab, p, c]) => `<div style="flex:${Math.max(0.04, p)};background:${c}"><span>${esc(lab)} · ${pc(p)}</span></div>`).join("")}</div>`;
+function sportLoading(el, msg, again) {
+  el.innerHTML = `<div class="loader" style="padding:60px 0"><div class="spinner"></div>${esc(msg)}</div>`;
+  clearTimeout(SP.poll); SP.poll = setTimeout(again, 6000);
+}
+// ---------- TENIS ----------
+async function openTennis(tour) {
+  SP.tour = tour === "wta" ? "wta" : "atp";
+  const el = $("view-sport");
+  setRails(null, null);
+  let d;
+  try { d = await getJSON("/sport/tennis?tour=" + SP.tour); } catch (e) { el.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (!location.hash.startsWith("#tenis")) return;
+  if (d.loading) return sportLoading(el, `Stahuji tenisové zápasy celé sezóny a počítám sílu hráčů… (poprvé to trvá 1–2 minuty)`, () => openTennis(SP.tour));
+  const czIds = new Set(d.czech.map((c) => c.id));
+  const ms = d.matches.filter((m) => !SP.czOnly || m.p.some((p) => p.cz));
+  el.innerHTML = `
+    <section class="cine sporthero ten"><div class="kicker">tenis · ${SP.tour === "atp" ? "muži (ATP)" : "ženy (WTA)"}</div>
+      <h1 class="display">Tenis<span>${SP.tour === "atp" ? "Češi na okruhu" : "Češky na okruhu"}</span></h1>
+      <p class="lead">Model prošel <b>${d.nMatches}</b> zápasů dvouhry za poslední dvě sezóny a každému hráči spočítal <b>sílu (Elo)</b>. Z ní počítá šanci na výhru, na sety a férové kurzy.</p>
+      <div class="seg" id="tour"><button data-v="atp" class="${SP.tour === "atp" ? "on" : ""}">Muži – ATP</button><button data-v="wta" class="${SP.tour === "wta" ? "on" : ""}">Ženy – WTA</button></div>
+    </section>
+    <div class="helpbox"><div class="help" style="margin:0"><ul>
+      <li><b>Elo</b> = síla hráče. Výhra nad silným soupeřem ji zvedne hodně, nad slabým málo. 1500 = průměr, 1800+ = světová špička. Rozdíl 100 bodů ≈ 64 % šance pro silnějšího.</li>
+      <li><b>Sety</b>: šance na přesný výsledek na sety (2:0, 2:1…). <b>Přes 2,5 setu</b> = zápas půjde do třetího setu. <b>Aspoň set</b> = hráč uhraje alespoň jeden set.</li>
+      <li><b>Férový kurz</b> = kurz, při kterém by sázka byla „na nulu“. Do políček napiš kurz z Tipsportu a uvidíš <b>hodnotu</b> (zelená = vyplatí se).</li>
+      <li>Tenisová data neobsahují povrch (antuka/tráva/tvrdý), takže model bere celkovou formu. Na antuce/trávě ber tipy s rezervou.</li>
+    </ul></div></div>
+    ${d.czech.length ? `<div class="sechead"><span class="no">🇨🇿</span><h2>${SP.tour === "atp" ? "Češi" : "Češky"}</h2><span class="hint">žebříček, síla, forma, další zápas</span></div>
+    <div class="czgrid">${d.czech.map((c) => `<div class="card czc" data-tp="${esc(c.id)}">
+      <div class="row1">${flagImg(c.flag, "Česko")}<b class="pname-link">${esc(c.name)}</b>${c.next ? `<span class="pill good">hraje</span>` : ""}</div>
+      <div class="big3"><div><small>Žebříček</small><b>${c.rank ? c.rank + "." : "–"}</b></div><div><small>Síla (Elo)</small><b>${c.elo}</b></div><div><small>Forma (10)</small><b>${c.form.w}–${c.form.l}</b></div></div>
+      ${dots(c.form.last)}
+      ${c.last.slice(0, 3).map((x) => `<div class="tl ${x.win ? "w" : "l"}"><span>${x.win ? "✅" : "❌"} ${esc(x.opp)}</span><small>${esc(x.score)} · ${esc(x.event || "")}</small></div>`).join("")}
+      ${c.next ? `<a class="btn" href="#tz-${esc(c.next)}" data-scroll="tz-${esc(c.next)}" style="margin-top:8px;display:inline-block">Další zápas →</a>` : ""}
+    </div>`).join("")}</div>` : ""}
+    <div class="sechead"><span class="no">01</span><h2>Zápasy</h2><span class="hint">živě · dnes · další dny</span></div>
+    <label class="help" style="display:inline-flex;gap:8px;align-items:center;cursor:pointer"><input type="checkbox" id="czonly" ${SP.czOnly ? "checked" : ""}> Ukázat jen zápasy Čechů a Češek</label>
+    <div class="grid g2" style="margin-top:10px">${ms.length ? ms.map((m) => tennisCard(m)).join("") : `<p class="help">Teď nejsou naplánované žádné zápasy${SP.czOnly ? " s Čechy" : ""}. Sezóna může mít přestávku.</p>`}</div>
+    <div class="sechead"><span class="no">02</span><h2>Nejsilnější hráči</h2><span class="hint">podle Elo modelu</span></div>
+    <div class="tablewrap"><table class="t"><thead><tr><th class="left">#</th><th class="left">Hráč</th><th>Elo</th><th>Žebříček</th><th>Forma (10)</th></tr></thead><tbody>
+      ${d.elo.map((p, i) => `<tr class="${p.cz ? "czrow" : ""}"><td class="left">${i + 1}</td><td class="left">${flagImg(p.flag, p.country)} <b class="pname-link" data-tp="${esc(p.id)}">${esc(p.name)}</b> <small class="muted">${esc(p.country || "")}</small></td><td class="gold">${p.elo}</td><td>${p.rank ?? "–"}</td><td>${p.form.w}–${p.form.l} ${dots(p.form.last)}</td></tr>`).join("")}
+    </tbody></table></div>`;
+  segment($("tour"), (v) => (location.hash = "tenis-" + v));
+  $("czonly").onchange = (e) => { SP.czOnly = e.target.checked; openTennis(SP.tour); };
+  el.querySelectorAll("[data-scroll]").forEach((a) => (a.onclick = (e) => { e.preventDefault(); document.getElementById(a.dataset.scroll)?.scrollIntoView({ behavior: "smooth", block: "center" }); }));
+  clearTimeout(SP.poll);
+  if (d.matches.some((m) => m.state === "in")) SP.poll = setTimeout(() => location.hash.startsWith("#tenis") && openTennis(SP.tour), 60000);
+}
+function tennisCard(m) {
+  const [A, B] = m.p, pr = m.pred, live = m.state === "in", done = m.state === "post";
+  const pA = live && pr.live ? pr.live.pA : pr.pA;
+  const pl = (p, x) => `<div class="tp ${p.winner ? "win" : ""} ${p.cz ? "cz" : ""}">${flagImg(p.flag, p.country)}<b class="pname-link" data-tp="${esc(p.id)}">${esc(p.name)}</b>
+    <small class="muted">${p.rank ? "#" + p.rank : ""}${p.seed && p.seed !== p.rank ? ` · nasazen${SP.tour === "wta" ? "á" : "ý"} ${p.seed}` : ""}</small>
+    <span class="sets">${(p.sets || []).map((v) => `<i>${v}</i>`).join("")}</span><b class="pp">${done ? "" : pc(x)}</b></div>`;
+  const sets = Object.entries(pr.sets);
+  return `<div class="card tcard ${A.cz || B.cz ? "czm" : ""}" id="tz-${esc(m.id)}">
+    <div class="thead"><small>${esc(m.event || "")} · ${esc(m.round || "")}${m.bo === 5 ? " · na 3 vítězné sety" : ""}</small>
+      <span class="${live ? "livebadge" : "muted"}">${live ? `<span class="livedot"></span> ŽIVĚ` : done ? "konec" : fmtDay(m.date) + " " + fmtTime(m.date)}</span></div>
+    ${pl(A, pA)}${pl(B, 1 - pA)}
+    ${done ? "" : `${pbar([[A.name.split(" ").pop(), pA, "var(--cyan)"], [B.name.split(" ").pop(), 1 - pA, "#e8edf4"]])}
+    ${live && pr.live ? `<p class="help" style="margin:6px 0 0">⚡ Živě přepočteno podle stavu na sety ${pr.live.setsA}:${pr.live.setsB} (před zápasem ${pc(pr.pA)}).</p>` : ""}
+    <div class="chips" style="margin-top:8px">${sets.map(([k, v]) => `<span class="pill">${k} <b>${pc(v)}</b></span>`).join("")}</div>
+    <p class="help" style="margin:6px 0 0">Síla (Elo): ${pr.eloA} vs ${pr.eloB} · ${pr.over25 != null ? `přes 2,5 setu <b>${pc(pr.over25)}</b>` : `přes 3,5 setu <b>${pc(pr.over35)}</b>`} ·
+      aspoň set: ${esc(A.name.split(" ").pop())} <b>${pc(pr.aSet)}</b>, ${esc(B.name.split(" ").pop())} <b>${pc(pr.bSet)}</b> · formy ${A.form.w}–${A.form.l} / ${B.form.w}–${B.form.l}</p>
+    <div class="oins">${oddsIn(`t:${m.id}:A`, pA, "Tipsport " + A.name.split(" ").pop() + " (fér " + fairO(pA) + ")")}${oddsIn(`t:${m.id}:B`, 1 - pA, "Tipsport " + B.name.split(" ").pop() + " (fér " + fairO(1 - pA) + ")")}
+      ${pr.over25 != null ? oddsIn(`t:${m.id}:o25`, pr.over25, "přes 2,5 setu (fér " + fairO(pr.over25) + ")") : ""}</div>`}
+  </div>`;
+}
+async function openTennisPlayer(pid) {
+  const m = $("pmodal"), box = $("pmbox");
+  m.classList.remove("hidden");
+  box.innerHTML = `<button class="x" onclick="closePlayer()">✕</button><div class="loader"><div class="spinner"></div>Načítám…</div>`;
+  let d;
+  try { d = await getJSON(`/sport/tennisplayer?tour=${SP.tour}&id=${encodeURIComponent(pid)}`); } catch (e) { box.innerHTML += `<p class="err">${esc(e.message)}</p>`; return; }
+  const wr = d.wins + d.losses ? d.wins / (d.wins + d.losses) : null;
+  box.innerHTML = `<button class="x" onclick="closePlayer()">✕</button>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">${flagImg(d.flag, d.country)}<div class="display" style="font-size:42px">${esc(d.name || "")}</div>${d.cz ? `<span class="pill good">🇨🇿 Česko</span>` : `<span class="pill">${esc(d.country || "")}</span>`}</div>
+    <div class="simstats" style="margin-top:12px"><div><small>Žebříček</small><b>${d.rank ?? "–"}</b><small>${d.points ? Math.round(d.points) + " bodů" : ""}</small></div><div><small>Síla (Elo)</small><b>${d.elo}</b></div>
+      <div><small>Zápasy (2 sezóny)</small><b>${d.wins}–${d.losses}</b><small>${wr != null ? Math.round(wr * 100) + " % výher" : ""}</small></div><div><small>Věk</small><b>${d.age ?? "–"}</b></div></div>
+    <h3 style="margin:16px 0 6px">Posledních ${d.last.length} zápasů</h3>
+    <div class="tablewrap"><table class="t"><thead><tr><th class="left">Datum</th><th class="left">Turnaj</th><th class="left">Soupeř</th><th>Výsledek</th><th>Skóre</th></tr></thead><tbody>
+      ${d.last.map((x) => `<tr><td class="left">${fmtDate(x.date)}</td><td class="left">${esc(x.event || "")} <small class="muted">${esc(x.round || "")}</small></td><td class="left">${esc(x.opp)} <small class="muted">${esc(x.oppCountry || "")}</small></td><td>${x.win ? "✅" : "❌"}</td><td>${esc(x.score)}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("[data-tp]");
+  if (e.target.closest && e.target.closest("[data-scroll]")) return;
+  if (a && location.hash.startsWith("#tenis")) { e.preventDefault(); e.stopPropagation(); openTennisPlayer(a.dataset.tp); }
+}, true);
+// ---------- FOTBAL ----------
+async function openFootball(lg) {
+  const el = $("view-sport");
+  setRails(null, null);
+  let d;
+  try { d = await getJSON("/sport/football?league=" + encodeURIComponent(lg)); } catch (e) { el.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (!location.hash.startsWith("#fotbal")) return;
+  if (d.loading) return sportLoading(el, "Stahuji zápasy Ligy mistrů, Ligy národů, české ligy a top lig a počítám sílu týmů… (poprvé 1–3 minuty)", () => openFootball(lg));
+  el.innerHTML = `
+    <section class="cine sporthero fb"><div class="kicker">fotbal · předpovědi a kurzy</div><h1 class="display">Fotbal<span>${esc(d.name)}</span></h1>
+      <p class="lead">Model spočítal útok a obranu každého týmu ze všech odehraných zápasů (novější zápasy mají větší váhu, týmy z různých lig propojují evropské poháry). Z toho počítá šance na výsledek, góly a přesné skóre.</p></section>
+    <div class="lgchips">${d.leagues.map((x) => `<a class="chip ${x.code === lg ? "on" : ""}" href="#fotbal-${encodeURIComponent(x.code)}">${esc(x.name)}</a>`).join("")}</div>
+    <div class="helpbox"><div class="help" style="margin:0"><ul>
+      <li><b>1 / X / 2</b> = výhra domácích / remíza / výhra hostů. Šance jsou mix modelu a trhu (kurzů sázkovek) – když tým má málo zápasů, víc věřím trhu.</li>
+      <li><b>xG</b> = kolik gólů tým v průměru čekám. <b>Oba dají gól</b> = šance, že skórují oba týmy. <b>Přes 2,5</b> = padnou 3 a víc gólů.</li>
+      <li><b>Hodnota</b> u kurzů DraftKings (americká sázkovka, přepočteno na naše kurzy) a u tvých kurzů z Tipsportu: zelená = sázka se podle modelu vyplatí.</li>
+    </ul></div></div>
+    <div class="grid g2">${d.matches.length ? d.matches.map(fbCard).join("") : `<p class="help">V příštích dnech tu nejsou žádné zápasy.</p>`}</div>
+    ${d.table.length ? `<div class="sechead"><span class="no">📊</span><h2>Tabulka</h2><span class="hint">spočítaná z odehraných zápasů</span></div>
+      <div class="tablewrap"><table class="t"><thead><tr><th class="left">#</th><th class="left">Tým</th><th>Z</th><th>V</th><th>R</th><th>P</th><th>Skóre</th><th>Body</th></tr></thead><tbody>
+      ${d.table.map((r, i) => `<tr><td class="left">${i + 1}</td><td class="left"><img class="tlogo" src="${esc(r.logo || "")}" alt=""> <b>${esc(r.name)}</b></td><td>${r.gp}</td><td>${r.w}</td><td>${r.d}</td><td>${r.l}</td><td>${r.gf}:${r.ga}</td><td class="gold">${r.pts}</td></tr>`).join("")}</tbody></table></div>` : ""}`;
+}
+function fbCard(m) {
+  const p = m.pred, live = m.state === "in", done = m.state === "post";
+  const form = (f) => f.map((x) => `<i class="fr ${x.r}" title="${esc(x.s + " vs " + x.opp)}">${x.r}</i>`).join("");
+  const st = (s) => (s ? `${s.shots} střel (${s.sot} na bránu) · držení ${s.poss} %` : "");
+  const team = (t, f, s) => `<div class="fbt"><img src="${esc(t.logo || "")}" alt=""><div><b>${esc(t.name)}</b><small class="muted">${st(s)}</small><span class="form">${form(f)}</span></div>${live || done ? `<b class="sc">${esc(t.score ?? "")}</b>` : ""}</div>`;
+  let body = "";
+  if (p && !done) {
+    const f = p.final;
+    body = `${pbar([["1", f["1"], "var(--cyan)"], ["X", f["X"], "#8d9aae"], ["2", f["2"], "#e8edf4"]])}
+      <p class="help" style="margin:6px 0 0">xG ${p.xgH} : ${p.xgA} · přes 2,5 gólu <b>${pc(p.ou[2.5])}</b> · přes 1,5 <b>${pc(p.ou[1.5])}</b> · oba dají gól <b>${pc(p.btts)}</b> · 1X ${pc(p.dc["1X"])} · X2 ${pc(p.dc["X2"])}${p.thin ? " · ⚠ málo zápasů, víc věřím kurzům" : ""}</p>
+      <div class="chips" style="margin-top:6px">${p.cs.map(([k, v]) => `<span class="pill">${k} <b>${pc(v)}</b></span>`).join("")}</div>
+      ${m.odds ? `<p class="help" style="margin:6px 0 0">${esc(m.odds.book)}: 1 <b>${m.odds.home}</b>${m.odds.draw ? ` · X <b>${m.odds.draw}</b>` : ""} · 2 <b>${m.odds.away}</b>${p.ev ? ` → hodnota ${["1", "X", "2"].map((k) => `${k} <span class="${p.ev[k] > 0.03 ? "okc" : p.ev[k] < -0.03 ? "noc" : ""}">${p.ev[k] > 0 ? "+" : ""}${Math.round(p.ev[k] * 100)} %</span>`).join(" · ")}` : ""}
+        ${p.market ? `<br><small class="muted">Model sám: 1 ${pc(p.model["1"])} · X ${pc(p.model["X"])} · 2 ${pc(p.model["2"])} | trh: 1 ${pc(p.market["1"])} · X ${pc(p.market["X"])} · 2 ${pc(p.market["2"])}</small>` : ""}</p>` : ""}
+      <div class="oins">${oddsIn(`f:${m.id}:1`, f["1"], "Tipsport 1 (fér " + fairO(f["1"]) + ")")}${oddsIn(`f:${m.id}:X`, f["X"], "X (fér " + fairO(f["X"]) + ")")}${oddsIn(`f:${m.id}:2`, f["2"], "2 (fér " + fairO(f["2"]) + ")")}
+        ${oddsIn(`f:${m.id}:o25`, p.ou[2.5], "přes 2,5 (fér " + fairO(p.ou[2.5]) + ")")}${oddsIn(`f:${m.id}:btts`, p.btts, "oba dají (fér " + fairO(p.btts) + ")")}</div>`;
+  }
+  return `<div class="card fbcard"><div class="thead"><small>${esc(m.note || "")}</small><span class="${live ? "livebadge" : "muted"}">${live ? `<span class="livedot"></span> ${esc(m.detail || "ŽIVĚ")}` : done ? "konec" : fmtDay(m.date) + " " + fmtTime(m.date)}</span></div>
+    ${team(m.home, m.formH, m.statsH)}${team(m.away, m.formA, m.statsA)}${body}</div>`;
+}
+// ---------- ČESKÝ HOKEJ ----------
+async function openCzHockey(lg) {
+  const el = $("view-sport");
+  setRails(null, null);
+  let d;
+  try { d = await getJSON("/sport/czhockey?league=" + encodeURIComponent(lg)); } catch (e) { el.innerHTML = `<div class="loader err">${esc(e.message)}</div>`; return; }
+  if (!location.hash.startsWith("#hokejcz")) return;
+  const hero = `<section class="cine sporthero czh"><div class="kicker">český hokej</div><h1 class="display">Extraliga<span>a Maxa liga</span></h1>
+      <p class="lead">Předpovědi pro Tipsport extraligu a Maxa ligu: šance na výhru po 60 minutách i včetně prodloužení, góly a férové kurzy.</p></section>`;
+  if (d.nokey) {
+    el.innerHTML = hero + `<div class="card" style="margin-top:16px"><h3 style="margin-top:0">🔑 Ještě chybí klíč k datům</h3>
+      <p class="help">Pro Extraligu a Maxa ligu neexistují veřejná data zdarma. Použijeme <b>API-Sports</b> – má <b>bezplatný plán (100 dotazů denně)</b>, to webu stačí. Postup (5 minut):</p>
+      <ol class="help"><li>Zaregistruj se na <a href="https://dashboard.api-football.com/register" target="_blank" rel="noopener">dashboard.api-football.com</a> (jeden účet platí pro hokej i fotbal), potvrď e-mail.</li>
+        <li>V levém menu <b>Account → My Access</b> zkopíruj <b>API Key</b>.</li>
+        <li>Na <b>render.com</b> → tvoje služba → <b>Environment</b> → <b>Add Environment Variable</b>: název <code>API_SPORTS_KEY</code>, hodnota = ten klíč → <b>Save</b>.</li>
+        <li>Render web restartuje a do pár minut se tu objeví zápasy.</li></ol></div>`;
+    return;
+  }
+  if (d.loading) return sportLoading(el, d.error ? "Chyba dat: " + d.error : "Stahuji zápasy Extraligy a Maxa ligy…", () => openCzHockey(lg));
+  el.innerHTML = hero + `<div class="lgchips">${d.leagues.map((x) => `<a class="chip ${x === d.league ? "on" : ""}" href="#hokejcz-${encodeURIComponent(x)}">${esc(x)}</a>`).join("")}</div>
+    <div class="helpbox"><div class="help" style="margin:0"><ul><li><b>Po 60 min (1/0/2)</b> = výsledek základní hrací doby, tak jak ho bere Tipsport u sázky „Zápas“. <b>Vítěz vč. prodloužení</b> = kdo nakonec vyhraje.</li>
+      <li>Model počítá útok a obranu týmů z odehraných zápasů sezóny (góly v základní době, domácí prostředí, novější zápasy víc). Do políček dej kurzy z Tipsportu a uvidíš hodnotu.</li></ul></div></div>
+    <div class="grid g2">${d.matches.length ? d.matches.map((g) => czhCard(g)).join("") : `<p class="help">Žádné zápasy v nejbližších dnech.</p>`}</div>
+    ${d.table.length ? `<div class="sechead"><span class="no">📊</span><h2>Tabulka</h2></div><div class="tablewrap"><table class="t"><thead><tr><th class="left">#</th><th class="left">Tým</th><th>Z</th><th>V</th><th>VP</th><th>PP</th><th>P</th><th>Skóre</th><th>Body</th></tr></thead><tbody>
+      ${d.table.map((r, i) => `<tr><td class="left">${i + 1}</td><td class="left"><img class="tlogo" src="${esc(r.logo || "")}" alt=""> <b>${esc(r.name)}</b></td><td>${r.gp}</td><td>${r.w}</td><td>${r.otw}</td><td>${r.otl}</td><td>${r.l}</td><td>${r.gf}:${r.ga}</td><td class="gold">${r.pts}</td></tr>`).join("")}</tbody></table></div>` : ""}`;
+}
+function czhCard(g) {
+  const p = g.pred, live = ["P1", "P2", "P3", "OT", "PT", "BT", "LIVE"].includes(g.status), done = ["FT", "AOT", "AP"].includes(g.status);
+  const form = (f) => f.map((x) => `<i class="fr ${x.r}" title="${esc(x.s + " vs " + x.opp)}">${x.r}</i>`).join("");
+  const team = (t, f) => `<div class="fbt"><img src="${esc(t.logo || "")}" alt=""><div><b>${esc(t.name)}</b><span class="form">${form(f)}</span></div>${live || done ? `<b class="sc">${t.score ?? ""}</b>` : ""}</div>`;
+  return `<div class="card fbcard"><div class="thead"><small>${esc(g.league)}</small><span class="${live ? "livebadge" : "muted"}">${live ? `<span class="livedot"></span> ${esc(g.statusLong || "ŽIVĚ")}` : done ? "konec" + (g.status !== "FT" ? " (" + g.status + ")" : "") : fmtDay(g.date) + " " + fmtTime(g.date)}</span></div>
+    ${team(g.home, g.formH)}${team(g.away, g.formA)}
+    ${p && !done ? `${pbar([["1", p.reg["1"], "var(--cyan)"], ["0", p.reg["0"], "#8d9aae"], ["2", p.reg["2"], "#e8edf4"]])}
+      <p class="help" style="margin:6px 0 0">Po 60 min · vítěz vč. prodl.: domácí <b>${pc(p.win.home)}</b>, hosté <b>${pc(p.win.away)}</b> · čekané góly ${p.xgH} : ${p.xgA} · přes 4,5 <b>${pc(p.ou[4.5])}</b> · přes 5,5 <b>${pc(p.ou[5.5])}</b></p>
+      <div class="oins">${oddsIn(`h:${g.id}:1`, p.reg["1"], "Tipsport 1 (fér " + fairO(p.reg["1"]) + ")")}${oddsIn(`h:${g.id}:0`, p.reg["0"], "0 (fér " + fairO(p.reg["0"]) + ")")}${oddsIn(`h:${g.id}:2`, p.reg["2"], "2 (fér " + fairO(p.reg["2"]) + ")")}
+        ${oddsIn(`h:${g.id}:o55`, p.ou[5.5], "přes 5,5 (fér " + fairO(p.ou[5.5]) + ")")}</div>` : ""}</div>`;
 }
 // ===================================================================
 //  Analýza hráče (okno)
